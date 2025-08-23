@@ -1,0 +1,258 @@
+:root {
+  --blue:#5b9bd5;
+  --white:#fff;
+  --aside-width:10vw;
+  --main-width:calc(100vw - var(--aside-width));
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin:0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--white);
+}
+
+.wrap {
+  display:flex;
+  height:100dvh;
+}
+
+aside {
+  width:var(--aside-width);
+  background:var(--blue);
+  padding:calc(var(--aside-width) * 0.25) 0;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+}
+
+.navbtn {
+  width:calc(var(--aside-width) * 0.625);
+  margin:1.5vh 0;
+  padding:2.25vh 0;
+  background:var(--white);
+  color:var(--blue);
+  border:none;
+  border-radius:2vh;
+  font-size: calc(var(--aside-width) * 0.16);
+  font-weight:600;
+}
+
+.lang {
+  margin-top:auto;
+  width:calc(var(--aside-width) * 0.75);
+  height:calc(var(--aside-width) * 0.75);
+  border-radius:50%;
+  background:#a9c7e6;
+  color:#2b6cb0;
+  border:none;
+  font-size: calc(var(--aside-width) * 0.16);
+  font-weight:600;
+}
+
+main {
+  flex:1;
+  position:relative;
+  overflow:hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* convPanel은 flex 아이템으로 설정하고, chat-open 클래스에 따라 flex 비율 조정 */
+#convPanel {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  transition: flex 0.5s ease;
+}
+
+/* 얼굴 단계 */
+#faceStage {
+  flex: 1; /* 기본 상태: 전체 공간 차지 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: flex 0.5s ease;
+}
+
+/* chat-open 클래스에 따라 flex 비율을 변경 */
+body.chat-open #faceStage {
+  flex: 0.3;
+}
+
+#faceBtn {
+  --face-size: calc(var(--main-width) * 0.6);
+  width: var(--face-size);
+  height: calc(var(--face-size) * 0.5);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.5s ease;
+}
+
+body.chat-open #faceBtn {
+  --face-size: calc(var(--main-width) * 0.3 * 0.6);
+}
+
+.eyes {
+  display: flex;
+  gap: calc(var(--face-size) * 0.45);
+  justify-content: center;
+  margin-bottom: calc(var(--face-size) * 0.03);
+  transition: all 0.5s ease;
+}
+
+.eye {
+  height: calc(var(--face-size) * 0.25);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: var(--blue);
+  position: relative;
+  transition: all 0.5s ease;
+}
+
+.pupil {
+  width: calc(var(--face-size) * 0.12);
+  height: calc(var(--face-size) * 0.12);
+  border-radius: 50%;
+  background: var(--white);
+  position: absolute;
+  top: 50%;
+  left: 65%;
+  transform: translate(-50%, -50%);
+  transition: all 0.5s ease;
+}
+
+.mouth {
+  width: calc(var(--face-size) * 0.25);
+  height: calc(var(--face-size) * 0.125);
+  border: calc(var(--face-size) * 0.05) solid var(--blue);
+  border-top: none;
+  border-radius: 0 0 120px 120px;
+  transform: translate(-35%, 0%) rotate(20deg);
+  margin: 0 auto;
+  transition: all 0.5s ease;
+}
+
+.hint {
+  position:absolute;
+  bottom:60px;
+  width:100%;
+  text-align:center;
+  color:var(--blue);
+  font-size:32px;
+  font-weight:600;
+  pointer-events:none;
+  opacity: 1;
+  transition: opacity 0.5s ease;
+}
+
+body.chat-open .hint {
+  opacity: 0;
+}
+
+/* 채팅 단계 */
+#chatStage{
+  flex: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: flex 0.5s ease;
+}
+
+body.chat-open #chatStage {
+  flex: 0.7;
+}
+
+/* 메시지 리스트 */
+.messages{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  max-height: 42vh;
+  overflow:auto;
+  padding-right:8px;
+  opacity: 0;
+  transition: opacity 0.5s ease 0.5s;
+}
+
+body.chat-open .messages {
+  opacity: 1;
+}
+
+.bubble {
+  display:inline-block;
+  padding:14px 18px;
+  border-radius:16px;
+  margin:8px 0;
+  max-width:min(720px, 70%);
+  line-height:1.35;
+}
+
+.bot {
+  background:var(--blue);
+  color:#fff;
+  align-self:flex-start;
+}
+
+.user {
+  background:#fff;
+  color:#2d3748;
+  border:2px solid var(--blue);
+  align-self:flex-end;
+}
+
+.row {
+  display:flex;
+}
+
+.tail-left::after {
+  content:"";
+  position:relative;
+  left:-10px; top:0;
+  border:10px solid transparent;
+  border-right-color:var(--blue);
+}
+
+.tail-right::after {
+  content:"";
+  position:relative;
+  right:-10px;
+  top:0;
+  border:10px solid transparent;
+  border-left-color:var(--blue);
+}
+
+/* 정보 패널 */
+#infoPanel {
+  flex-basis: 0;
+  opacity: 0;
+  overflow: hidden;
+  margin-top: 0;
+  transition: flex-basis 0.5s ease, opacity 0.5s ease;
+  background: var(--blue);
+  color: var(--white);
+  border-radius: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+}
+body.chat-open #infoPanel {
+  flex-basis: 42vh;
+  margin-top: 24px;
+  opacity: 1;
+}
+
+.message.robot {
+  opacity: 0;
+  transform: scale(0.5) translateY(20px);
+  transition: opacity 0.3s ease-in-out, transform 0.3s ease-in-out;
+}
+
+.message.robot.show {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+}

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>TourBot</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <aside>
+      <button class="navbtn">지도</button>
+      <button class="navbtn">정보</button>
+      <button class="navbtn">호출</button>
+      <button class="lang">언어</button>
+    </aside>
+
+    <main>
+      <div id="convPanel">
+        <section id="faceStage">
+          <button id="faceBtn" aria-label="얼굴 클릭">
+            <div class="eyes">
+              <div class="eye">
+                <div class="pupil"></div>
+              </div>
+              <div class="eye">
+                <div class="pupil"></div>
+              </div>
+            </div>
+            <div class="mouth"></div>
+          </button>
+          <div class="hint">“빠니bot틀아!” 라고 불러주세요</div>
+        </section>
+
+        <section id="chatStage">
+          <div id="messages" class="messages"></div>
+          <audio id="player"></audio>
+        </section>
+      </div>
+
+      <section id="infoPanel">어쩌구저쩌구</section>
+    </main>
+  </div>
+
+  <script>
+    const BASE = location.origin;
+    const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/kiosk";
+    const body = document.body;
+    const faceBtn = document.getElementById("faceBtn");
+    const messages = document.getElementById("messages");
+    const player = document.getElementById("player");
+
+    // 'body'에 'chat-open' 클래스를 토글하여 모든 애니메이션을 제어
+    faceBtn.addEventListener("click", () => {
+      body.classList.toggle('chat-open');
+    });
+
+    // transition이 끝난 후 메시지 표시 (한 번만)
+    let hasShownMessage = false;
+    body.addEventListener('transitionend', (e) => {
+      // 'chat-open' 클래스가 있고, 아직 메시지를 보여주지 않았다면
+      if (body.classList.contains('chat-open') && !hasShownMessage) {
+        showRobotMessage();
+        hasShownMessage = true;
+      }
+      // 'chat-open' 클래스가 사라지면 다음 클릭을 위해 상태 초기화
+      if (!body.classList.contains('chat-open')) {
+        hasShownMessage = false;
+      }
+    });
+
+    function addMsg(who, text) {
+      const row = document.createElement("div");
+      row.className = "row " + (who === "bot" ? "left" : "right");
+      const b = document.createElement("div");
+      b.className = "bubble " + (who === "bot" ? "bot" : "user");
+      b.textContent = text;
+      row.appendChild(b);
+      messages.appendChild(row);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function recordAndSendOnce() {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const chunks = [];
+      mr.ondataavailable = e => chunks.push(e.data);
+      const stopped = new Promise(res => mr.onstop = () => res());
+      mr.start();
+      setTimeout(()=>mr.stop(), 2500);
+      await stopped;
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: "audio/webm" });
+
+      const fd = new FormData();
+      fd.append("file", blob, "speech.webm");
+      const up = await fetch(`${BASE}/upload-audio/`, { method:"POST", body: fd });
+      const { file_id } = await up.json();
+
+      const ws = new WebSocket(WS_URL);
+      ws.onopen = () => ws.send(JSON.stringify({ file_id }));
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.stage === "stt" && msg.text) addMsg("user", msg.text);
+        if (msg.stage === "llm" && msg.text) addMsg("bot", msg.text);
+        if (msg.stage === "tts" && msg.audio_url) {
+          player.src = msg.audio_url;
+          player.play().catch(()=>{});
+        }
+      };
+    }
+
+    function showRobotMessage() {
+      const messagesContainer = document.getElementById('messages');
+      const message = document.createElement('div');
+      message.className = 'message robot';
+      message.textContent = "안녕하세요! 무엇을 도와드릴까요?";
+      
+      messagesContainer.appendChild(message);
+      
+      setTimeout(() => {
+          message.classList.add('show');
+      }, 100);
+    }
+  </script>
+</body>
+</html>
