@@ -29,7 +29,7 @@
             </div>
             <div class="mouth"></div>
           </button>
-          <div class="hint">“빠니bot틀아!” 라고 불러주세요</div>
+          <div class="hint">“에스뽀!” 라고 불러주세요</div>
         </section>
 
         <section id="chatStage">
@@ -52,20 +52,21 @@
 
     // 'body'에 'chat-open' 클래스를 토글하여 모든 애니메이션을 제어
     faceBtn.addEventListener("click", () => {
+      const opening = !body.classList.contains('chat-open');
       body.classList.toggle('chat-open');
+
+      if (opening) {
+        // 새로 열 때 이전 대화 초기화
+        messages.innerHTML = "";
+        showRobotMessage();
+        recordAndSendOnce(); // 이 부분을 추가하여 채팅창 열리면 바로 음성 인식 시작
+      }
     });
 
     // transition이 끝난 후 메시지 표시 (한 번만)
-    let hasShownMessage = false;
+    // 이 리스너에서는 별도 메시지를 추가하지 않습니다.
     body.addEventListener('transitionend', (e) => {
-      // 'chat-open' 클래스가 있고, 아직 메시지를 보여주지 않았다면
-      if (body.classList.contains('chat-open') && !hasShownMessage) {
-        showRobotMessage();
-        hasShownMessage = true;
-      }
-      // 'chat-open' 클래스가 사라지면 다음 클릭을 위해 상태 초기화
       if (!body.classList.contains('chat-open')) {
-        hasShownMessage = false;
       }
     });
 
@@ -113,14 +114,11 @@
     function showRobotMessage() {
       const messagesContainer = document.getElementById('messages');
       const message = document.createElement('div');
-      message.className = 'message robot';
+      // **수정된 부분**: 'message robot' 대신 'bubble bot' 클래스 사용
+      message.className = 'bubble bot';
       message.textContent = "안녕하세요! 무엇을 도와드릴까요?";
       
       messagesContainer.appendChild(message);
-      
-      setTimeout(() => {
-          message.classList.add('show');
-      }, 100);
     }
   </script>
 </body>

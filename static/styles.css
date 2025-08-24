@@ -183,54 +183,57 @@ body.chat-open .messages {
 }
 
 .bubble {
+  background-color: var(--blue);
+  color:var(--white);
   display:inline-block;
   padding:14px 18px;
-  border-radius:16px;
-  margin:8px 0;
+  border-radius:10px;
+  margin:20px 40px;
   max-width:min(720px, 70%);
   line-height:1.35;
+  position: relative;
+  text-align: center;
 }
 
-.bot {
-  background:var(--blue);
-  color:#fff;
-  align-self:flex-start;
+/* 챗봇 말풍선 꼬리 */
+.bubble.bot::before {
+  content: "";
+  position: absolute;
+  top: 15px;
+  left: -40px;
+  width: 0;
+  height: 0;
+  border-top: 10px solid transparent;
+  border-bottom: 0px solid transparent;
+  border-right: 40px solid var(--blue); /* 이 값을 늘리면 가로로 길어집니다. */
 }
 
-.user {
-  background:#fff;
-  color:#2d3748;
-  border:2px solid var(--blue);
-  align-self:flex-end;
+/* 사용자 말풍선 꼬리 */
+.bubble.user::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: -9px;
+  width: 0;
+  height: 0;
+  border-top: 10px solid transparent;
+  border-bottom: 10px solid transparent;
+  border-left: 20px solid var(--blue); /* 이 값을 늘리면 가로로 길어집니다. */
 }
 
 .row {
-  display:flex;
+    display:flex;
+}
+.row.right {
+    justify-content: flex-end;
 }
 
-.tail-left::after {
-  content:"";
-  position:relative;
-  left:-10px; top:0;
-  border:10px solid transparent;
-  border-right-color:var(--blue);
-}
-
-.tail-right::after {
-  content:"";
-  position:relative;
-  right:-10px;
-  top:0;
-  border:10px solid transparent;
-  border-left-color:var(--blue);
-}
-
-/* 정보 패널 */
+/* 큰 패널(지도/정보/호출 영역) */
 #infoPanel {
   flex-basis: 0;
   opacity: 0;
   overflow: hidden;
-  margin-top: 0;
+  margin: 20px;
   transition: flex-basis 0.5s ease, opacity 0.5s ease;
   background: var(--blue);
   color: var(--white);
@@ -242,7 +245,7 @@ body.chat-open .messages {
 }
 body.chat-open #infoPanel {
   flex-basis: 42vh;
-  margin-top: 24px;
+  margin: 20px;
   opacity: 1;
 }
 
