@@ -11,7 +11,7 @@ app = FastAPI()
 
 # Whisper 모델 로딩
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = whisper.load_model("base", device=device)
+model = whisper.load_model("medium", device=device)
 
 # 오디오 길이 체크
 def is_audio_valid(file_path, min_duration=0.5):
@@ -20,7 +20,7 @@ def is_audio_valid(file_path, min_duration=0.5):
         duration = len(f) / f.samplerate
         return duration >= min_duration
     except:
-        return False
+        return True
 
 # 반복 패턴, 의미 없는 텍스트 필터링
 def clean_stt_text(text):
@@ -35,9 +35,9 @@ def clean_stt_text(text):
     if len(set(words)) == 1 and len(words) > 5:
         return ""
 
-    # 한글/영문 없는 경우
-    if not re.search(r"[가-힣a-zA-Z]", text):
-        return ""
+    # 한글/영문 없는 경우 (주석 처리 또는 삭제)
+    # if not re.search(r"[가-힣a-zA-Z]", text):
+    #     return ""
 
     return text
 
@@ -65,8 +65,10 @@ async def speech_to_text(file: UploadFile = File(...)):
         text = result.get("text", "")
 
         # 3. 후처리 필터링
-        # cleaned = clean_stt_text(text)
-        cleaned = cleaned
+        cleaned = clean_stt_text(text)
+
+        # 인식된 텍스트를 터미널에 출력하는 코드 추가
+        print(f"인식된 텍스트: {cleaned}")
 
         os.remove(tmp_path)
         return JSONResponse({"text": cleaned})

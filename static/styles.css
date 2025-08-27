@@ -171,54 +171,73 @@ body.chat-open #chatStage {
   display:flex;
   flex-direction:column;
   gap:12px;
+  margin:20px 0px;
   max-height: 42vh;
   overflow:auto;
   padding-right:8px;
   opacity: 0;
   transition: opacity 0.5s ease 0.5s;
+  font-size: 20px;
 }
 
 body.chat-open .messages {
   opacity: 1;
 }
 
-.bubble {
-  background-color: var(--blue);
+.bBubble {
+  background-color:var(--blue);
   color:var(--white);
   display:inline-block;
-  padding:14px 18px;
+  padding:25px 18px;
   border-radius:10px;
-  margin:20px 40px;
-  max-width:min(720px, 70%);
+  margin:0px 40px;
+  width:75%;
   line-height:1.35;
   position: relative;
   text-align: center;
 }
 
+.uBubble {
+  background-color:var(--white);
+  color:var(--blue);
+  border: 2px solid var(--blue);
+  display:inline-block;
+  padding:25px 18px;
+  border-radius:10px;
+  margin:0px 40px;
+  width:75%;
+  line-height:1.35;
+  position: relative;
+  text-align: center;
+  margin-right: 80px;
+  margin-left: auto; /* 오른쪽 정렬 */
+}
+
 /* 챗봇 말풍선 꼬리 */
-.bubble.bot::before {
+.bBubble.bot-bubble::before {
   content: "";
   position: absolute;
   top: 15px;
   left: -40px;
   width: 0;
   height: 0;
-  border-top: 10px solid transparent;
+  border-top: 15px solid transparent;
   border-bottom: 0px solid transparent;
   border-right: 40px solid var(--blue); /* 이 값을 늘리면 가로로 길어집니다. */
 }
 
 /* 사용자 말풍선 꼬리 */
-.bubble.user::after {
+.uBubble.user-bubble::after {
   content: "";
   position: absolute;
-  top: 10px;
-  right: -9px;
+  top: 15px;
+  right: -40px;
   width: 0;
   height: 0;
-  border-top: 10px solid transparent;
-  border-bottom: 10px solid transparent;
-  border-left: 20px solid var(--blue); /* 이 값을 늘리면 가로로 길어집니다. */
+  border-top: 0px solid transparent;
+  border-bottom: 15px solid transparent;
+  border-left: 40px solid var(--white); /* 이 값을 늘리면 가로로 길어집니다. */
+  border-left-color: var(--blue);
 }
 
 .row {
@@ -233,7 +252,7 @@ body.chat-open .messages {
   flex-basis: 0;
   opacity: 0;
   overflow: hidden;
-  margin: 20px;
+  margin: 40px;
   transition: flex-basis 0.5s ease, opacity 0.5s ease;
   background: var(--blue);
   color: var(--white);
@@ -244,18 +263,46 @@ body.chat-open .messages {
   font-size: 24px;
 }
 body.chat-open #infoPanel {
-  flex-basis: 42vh;
-  margin: 20px;
+  flex-basis: 50vh;
+  margin: 40px;
   opacity: 1;
 }
 
-.message.robot {
+.message {
   opacity: 0;
   transform: scale(0.5) translateY(20px);
   transition: opacity 0.3s ease-in-out, transform 0.3s ease-in-out;
 }
 
-.message.robot.show {
+.message.show {
   opacity: 1;
   transform: scale(1) translateY(0);
 }
+
+/* 버튼 인터랙션 */
+.navbtn, .lang {
+  transition: transform .15s ease, box-shadow .2s ease, background-color .2s ease, color .2s ease;
+  will-change: transform, box-shadow;
+  cursor: pointer;
+}
+
+.navbtn:hover, .lang:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 14px rgba(0,0,0,.18);
+  background: #eaf2fb;
+}
+
+.navbtn:active, .lang:active {
+  transform: translateY(0);
+  box-shadow: inset 0 3px 8px rgba(0,0,0,.2);
+}
+
+.navbtn:focus-visible, .lang:focus-visible {
+  outline: 3px solid #fff; /* 대비 높은 포커스 링 */
+  outline-offset: 2px;
+}
+
+/* 얼굴 버튼도 살짝 인터랙션 */
+#faceBtn { transition: transform .15s ease; }
+#faceBtn:hover { transform: scale(1.02); }
+#faceBtn:active { transform: scale(0.99); }

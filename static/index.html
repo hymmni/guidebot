@@ -1,11 +1,14 @@
 <!doctype html>
 <html lang="ko">
+
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>TourBot</title>
   <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/webaudio-recorder-js/lib-webaudio-recorder-js.min.js"></script>
 </head>
+
 <body>
   <div class="wrap">
     <aside>
@@ -43,83 +46,433 @@
   </div>
 
   <script>
+    'use strict';
+
+    // =========================
+    // 기본 환경
+    // =========================
     const BASE = location.origin;
     const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/kiosk";
-    const body = document.body;
-    const faceBtn = document.getElementById("faceBtn");
-    const messages = document.getElementById("messages");
-    const player = document.getElementById("player");
 
-    // 'body'에 'chat-open' 클래스를 토글하여 모든 애니메이션을 제어
+    const body = document.body;
+    const faceBtn = document.getElementById('faceBtn');
+    const messages = document.getElementById('messages');
+    const player = document.getElementById('player');
+    const infoPanel = document.getElementById('infoPanel');
+
+    // --- VAD 파라미터 ---
+    const VAD = {
+      rmsStart: 0.020,   // 녹음 시작 임계(RMS) - 크게 말해야 시작됨
+      rmsStop: 0.010,   // 녹음 종료 임계(RMS) - 이 값 아래가 일정시간 지속되면 정지
+      startHoldMs: 120,  // 시작 판정에 필요한 연속 구간(ms)
+      stopHoldMs: 800,   // 종료 판정에 필요한 연속 무음(ms)
+      maxRecordMs: 15000,// 한 턴 최대 녹음 길이(ms) 안전장치
+      debug: false       // 콘솔에 RMS 로그 출력 여부
+
+      // 민감도 튜닝 가이드
+      // - 말해도 시작이 늦다/안 된다 → rmsStart를 0.015~0.010으로 낮춘다.
+      // - 숨/환경소음에도 자주 시작된다 → rmsStart를 높이거나 startHoldMs를 150~250ms로 늘린다.
+      // - 끝난 뒤에도 오래 붙잡는다 → stopHoldMs를 500~700ms로 줄이거나 rmsStop을 0.012~0.015로 약간 올린다.
+      // - 최대 한 턴 길이를 제한하려면 maxRecordMs(기본 15초)를 조절한다.
+    };
+
+    // --- 상태 ---
+    let ws = null;
+    let mediaRecorder = null;
+    let audioStream = null;
+    let audioCtx = null, analyser = null, srcNode = null, rafId = 0;
+    let isRecording = false, recordStartTs = 0;
+    let lastTick = 0, voiceMs = 0, silenceMs = 0;
+    const vadBuf = new Float32Array(2048); // analyser.fftSize와 동일
+
+    // =========================
+    // UI 이벤트 (기존 동작 유지)
+    // =========================
     faceBtn.addEventListener("click", () => {
-      const opening = !body.classList.contains('chat-open');
+      const isChatOpen = body.classList.contains('chat-open');
       body.classList.toggle('chat-open');
 
-      if (opening) {
-        // 새로 열 때 이전 대화 초기화
+      if (!isChatOpen) {
         messages.innerHTML = "";
-        showRobotMessage();
-        recordAndSendOnce(); // 이 부분을 추가하여 채팅창 열리면 바로 음성 인식 시작
+        displayBotResponse("무엇을 도와드릴까요?");
+        playTTS("무엇을 도와드릴까요?"); // TTS 끝나면 player.onended에서 자동 청취
+      } else {
+        teardownAudio(); // 채팅 종료 시 오디오 자원 정리
       }
     });
 
-    // transition이 끝난 후 메시지 표시 (한 번만)
-    // 이 리스너에서는 별도 메시지를 추가하지 않습니다.
-    body.addEventListener('transitionend', (e) => {
-      if (!body.classList.contains('chat-open')) {
-      }
-    });
-
-    function addMsg(who, text) {
-      const row = document.createElement("div");
-      row.className = "row " + (who === "bot" ? "left" : "right");
-      const b = document.createElement("div");
-      b.className = "bubble " + (who === "bot" ? "bot" : "user");
-      b.textContent = text;
-      row.appendChild(b);
-      messages.appendChild(row);
-      messages.scrollTop = messages.scrollHeight;
+    function displayBotResponse(text) {
+      const message = document.createElement('div');
+      message.className = 'message bBubble bot-bubble';
+      message.textContent = text;
+      messages.appendChild(message);
+      setTimeout(() => {
+        message.classList.add('show');
+        message.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }, 100);
     }
 
-    async function recordAndSendOnce() {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    function displayUserMessage(text) {
+      const message = document.createElement('div');
+      message.className = 'message uBubble user-bubble';
+      message.textContent = text;
+      messages.appendChild(message);
+      setTimeout(() => {
+        message.classList.add('show');
+        message.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }, 100);
+    }
+
+    // =========================
+    // VAD 기반 녹음 → 업로드
+    // =========================
+    async function recordAndSend() {
+      // WS가 잠시 끊겨도 녹음/업로드는 진행하고, file_id 전송은 큐에 넣어 재연결 시 전송
+      try {
+        // 1) 마이크 스트림
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // 2) 분석용 AudioContext/Analyser
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        srcNode = audioCtx.createMediaStreamSource(audioStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048; // vadBuf 길이와 일치
+        analyser.smoothingTimeConstant = 0.2;
+        srcNode.connect(analyser);
+
+        // 3) 모니터 루프 시작 (VAD 판정)
+        resetVAD();
+        tick(); // requestAnimationFrame 루프 진입
+        console.log("VAD 대기 시작(말하면 자동 녹음).");
+      } catch (err) {
+        console.error("녹음 시작 실패:", err);
+        alert("마이크 권한을 허용해야 합니다. (HTTPS 또는 localhost 필요)");
+      }
+    }
+
+    function resetVAD() {
+      isRecording = false;
+      voiceMs = 0;
+      silenceMs = 0;
+      lastTick = 0;
+    }
+
+    function tick(ts = 0) {
+      if (!analyser) return; // 이미 종료됨
+
+      // 프레임 간 시간(ms)
+      if (lastTick === 0) lastTick = ts;
+      const dt = ts - lastTick;
+      lastTick = ts;
+
+      // 현재 RMS 계산
+      analyser.getFloatTimeDomainData(vadBuf);
+      let sum = 0;
+      for (let i = 0; i < vadBuf.length; i++) {
+        const v = vadBuf[i];
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / vadBuf.length); // 0.0 ~ 1.0 근사
+
+      if (VAD.debug) console.log("RMS:", rms.toFixed(4));
+
+      if (!isRecording) {
+        // 시작 조건: rmsStart 이상이 startHoldMs 지속
+        if (rms >= VAD.rmsStart) {
+          voiceMs += dt;
+          if (voiceMs >= VAD.startHoldMs) startRecording();
+        } else {
+          voiceMs = 0;
+        }
+      } else {
+        // 종료 조건: rmsStop 미만이 stopHoldMs 지속 or 최대 길이 초과
+        if (rms < VAD.rmsStop) {
+          silenceMs += dt;
+        } else {
+          silenceMs = 0;
+        }
+        const elapsed = performance.now() - recordStartTs;
+        if (silenceMs >= VAD.stopHoldMs || elapsed >= VAD.maxRecordMs) {
+          stopRecording(); // onstop에서 업로드
+          return; // 다음 프레임에서 analyser가 없으므로 루프 종료
+        }
+      }
+
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function chooseMime() {
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ];
+      for (const c of candidates) {
+        if (MediaRecorder.isTypeSupported?.(c)) return c;
+      }
+      return ''; // 브라우저 기본
+    }
+
+    function startRecording() {
+      if (!audioStream) return;
+
+      // onstop에서 전역을 보지 않도록, 선택된 mimeType을 캡처해 둔다.
+      const mimeType = chooseMime(); // 예: 'audio/webm;codecs=opus'
+      mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : {});
       const chunks = [];
-      mr.ondataavailable = e => chunks.push(e.data);
-      const stopped = new Promise(res => mr.onstop = () => res());
-      mr.start();
-      setTimeout(()=>mr.stop(), 2500);
-      await stopped;
-      stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(chunks, { type: "audio/webm" });
 
-      const fd = new FormData();
-      fd.append("file", blob, "speech.webm");
-      const up = await fetch(`${BASE}/upload-audio/`, { method:"POST", body: fd });
-      const { file_id } = await up.json();
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
 
-      const ws = new WebSocket(WS_URL);
-      ws.onopen = () => ws.send(JSON.stringify({ file_id }));
+      mediaRecorder.onstop = async (e) => {
+        // 시각화/분석 노드 정리 (mediaRecorder 전역은 아직 건드리지 않음)
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+        teardownNodes();
+
+        // ✅ 전역 mediaRecorder를 보지 말고 안전한 참조 사용
+        const rec = e?.target || mediaRecorder || null;
+        const blobType =
+          mimeType ||                      // 우리가 선택한 타입(가장 안전)
+          (rec && rec.mimeType) ||        // 일부 브라우저는 여기서 제공
+          'audio/webm';                   // 최후의 보루
+
+        const blob = new Blob(chunks, { type: blobType });
+        if (!blob || blob.size === 0) {
+          console.log("무음/장치 문제로 0바이트. 재대기 진입.");
+          setTimeout(() => {
+            if (body.classList.contains('chat-open')) recordAndSend();
+          }, 300);
+          // 스트림은 아래 finally에서 반납
+        }
+
+        try {
+          const fd = new FormData();
+          fd.append("file", blob, "speech.webm");
+          const up = await fetch(`${BASE}/upload-audio/`, { method: "POST", body: fd });
+          if (!up.ok) { console.error("업로드 실패:", up.status); return; }
+          const { file_id } = await up.json();
+          sendJson({ file_id }); // WS 열려있으면 즉시, 아니면 큐에 저장
+        } catch (err) {
+          console.error("업로드 오류:", err);
+        } finally {
+          // 여기서 mediaRecorder를 null로 정리해도 onstop 내부에는 영향 없음
+          teardownStream();
+        }
+      };
+
+      mediaRecorder.start();
+      isRecording = true;
+      recordStartTs = performance.now();
+      voiceMs = 0; // 이후부터는 종료 판정만 사용
+      console.log("녹음 시작 (VAD).");
+    }
+
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        mediaRecorder.stop();
+        console.log("녹음 종료 (VAD).");
+      }
+    }
+
+    // 채팅 닫을 때 전체 정리
+    function teardownAudio() {
+      try { stopRecording(); } catch { }
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+      teardownNodes();
+      teardownStream();
+    }
+
+    function teardownNodes() {
+      try { srcNode && srcNode.disconnect(); } catch { }
+      try { analyser && analyser.disconnect(); } catch { }
+      srcNode = null;
+      analyser = null;
+      if (audioCtx) {
+        // 일부 브라우저는 close 후 재사용 불가 → 매 턴 새로 만들게 한다
+        audioCtx.close().catch(() => { });
+        audioCtx = null;
+      }
+    }
+
+    function teardownStream() {
+      if (audioStream) {
+        try { audioStream.getTracks().forEach(t => t.stop()); } catch { }
+        audioStream = null;
+      }
+      mediaRecorder = null;
+      isRecording = false;
+    }
+
+    // =========================
+    // WebSocket (끊김 방지 개선)
+    // =========================
+    let wsRetry = 0;            // 지수 백오프 횟수
+    let wsTimer = null;         // 재연결 타이머
+    let hbTimer = null;         // 하트비트 타이머
+    let lastActivity = Date.now();
+    const outbox = [];          // 연결 끊겼을 때 보류할 메시지 큐
+
+    const HEARTBEAT_MS = 25_000; // 25초마다 ping
+    const STALL_MS = 65_000; // 활동 없음 감지 임계
+    const MAX_BACKOFF = 15_000; // 최대 백오프 15초
+
+    function stopHeartbeat() {
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    }
+
+    function startHeartbeat() {
+      stopHeartbeat();
+      hbTimer = setInterval(() => {
+        if (!ws) return;
+        // 1) ping
+        if (ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'ping' })); lastActivity = Date.now(); } catch { }
+        }
+        // 2) stall 감지
+        if (Date.now() - lastActivity > STALL_MS) {
+          console.warn("[WS] Stall detected → forcing reconnect");
+          scheduleReconnect(true);
+        }
+      }, HEARTBEAT_MS);
+    }
+
+    function tearDownSocket() {
+      if (!ws) return;
+      try { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; ws.close(1000, 'reinit'); } catch { }
+      ws = null;
+      stopHeartbeat();
+    }
+
+    function scheduleReconnect(immediate = false) {
+      if (wsTimer) return; // 중복 방지
+      const delay = immediate ? 0 : Math.min(1000 * Math.pow(2, wsRetry++), MAX_BACKOFF);
+      wsTimer = setTimeout(() => {
+        wsTimer = null;
+        initWebSocket();
+      }, delay);
+      console.log(immediate ? "[WS] Reconnect now" : `[WS] Reconnect in ${Math.round(delay / 1000)}s`);
+    }
+
+    function flushOutbox() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      while (outbox.length) {
+        const msg = outbox.shift();
+        try { ws.send(JSON.stringify(msg)); } catch (e) { console.warn("Outbox send failed, requeue", e); outbox.unshift(msg); break; }
+      }
+    }
+
+    function sendJson(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify(obj)); } catch (e) { console.warn("WS send failed, queueing", e); outbox.push(obj); }
+      } else {
+        outbox.push(obj);
+      }
+    }
+
+    function initWebSocket() {
+      tearDownSocket();
+
+      try {
+        ws = new WebSocket(WS_URL);
+      } catch (e) {
+        console.error("[WS] 생성 실패:", e);
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        console.log("WebSocket 연결 성공");
+        wsRetry = 0;
+        lastActivity = Date.now();
+        startHeartbeat();
+        flushOutbox(); // 끊긴 동안 쌓인 메시지 전송
+      };
+
       ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.stage === "stt" && msg.text) addMsg("user", msg.text);
-        if (msg.stage === "llm" && msg.text) addMsg("bot", msg.text);
+        lastActivity = Date.now();
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+
+        if (msg.stage === "stt" && msg.text) displayUserMessage(msg.text);
+        if (msg.stage === "llm" && msg.text) displayBotResponse(msg.text);
         if (msg.stage === "tts" && msg.audio_url) {
           player.src = msg.audio_url;
-          player.play().catch(()=>{});
+          player.playbackRate = 1.2;
+          player.play().catch(() => { });
         }
+        if (msg.stage === "ui" && msg.type === "show_map" && msg.url) {
+          showMap(msg.url);
+        }
+      };
+
+      ws.onclose = (ev) => {
+        console.log("WebSocket 연결 종료:", ev.code, ev.reason || "");
+        stopHeartbeat();
+        scheduleReconnect(); // 지수 백오프 재연결
+      };
+
+      ws.onerror = (err) => {
+        console.warn("WebSocket 오류:", err);
+        try { ws.close(); } catch { }
+        // onclose에서 재연결 스케줄링
       };
     }
 
-    function showRobotMessage() {
-      const messagesContainer = document.getElementById('messages');
-      const message = document.createElement('div');
-      // **수정된 부분**: 'message robot' 대신 'bubble bot' 클래스 사용
-      message.className = 'bubble bot';
-      message.textContent = "안녕하세요! 무엇을 도와드릴까요?";
-      
-      messagesContainer.appendChild(message);
+    // 네트워크/가시성 회복 시 즉시 재연결
+    window.addEventListener('online', () => scheduleReconnect(true));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && (!ws || ws.readyState !== WebSocket.OPEN)) {
+        scheduleReconnect(true);
+      }
+    });
+
+    // =========================
+    // TTS 끝나면 듣기 대기 진입
+    // =========================
+    player.onended = () => {
+      if (body.classList.contains('chat-open')) {
+        // TTS 끝나면 VAD 대기 → 말하면 자동 녹음
+        recordAndSend();
+      }
+    };
+
+    // =========================
+    // 지도 표시 (서버 지시 수신용)
+    // =========================
+    function showMap(url) {
+      infoPanel.innerHTML = `<img id="mapImg" src="${url}" alt="지도" style="max-width:100%;height:auto;display:block;margin:8px auto;" />`;
     }
+
+    // =========================
+    // TTS 요청
+    // =========================
+    async function playTTS(text) {
+      try {
+        const res = await fetch(`${BASE}/request-response`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, speed: 1.0 })
+        });
+        const { audio_url } = await res.json();
+        if (audio_url) {
+          player.src = audio_url;
+          player.playbackRate = 1.2;
+          player.play().catch(() => { });
+        }
+      } catch (e) {
+        console.error("TTS 재생 오류:", e);
+      }
+    }
+
+    // 최초 연결
+    initWebSocket();
   </script>
+
 </body>
+
 </html>

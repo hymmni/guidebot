@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, Body
+from fastapi import FastAPI, WebSocket, UploadFile, File, Body, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -7,14 +7,26 @@ from pydantic import BaseModel
 
 import uuid
 import shutil
-import os
+import os, json, asyncio
 import requests
 
 # ===============================
 # 앱 설정
 # ===============================
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+# 예) static/maps/floor1.png, static/maps/floor2.png 등이 존재
 
+MAP_FILES = {
+    "default": "venue_map.png",
+    "1f": "floor1.png",
+    "2f": "floor2.png",
+}
+def resolve_map_url(key: str | None) -> str:
+    k = (key or "default").lower().replace(" ", "")
+    fname = MAP_FILES.get(k, MAP_FILES["default"])
+    return f"/static/maps/{fname}"
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,8 +77,8 @@ def run_llm_intent(user_text: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-def run_tts(text: str) -> str:
-    response = requests.post(f"{TTS_SERVER_URL}/tts", json={"text": text, "speed": 1.0})
+def run_tts(text: str, speed: float) -> str:
+    response = requests.post(f"{TTS_SERVER_URL}/tts", json={"text": text, "speed": speed})
     if response.status_code != 200:
         raise RuntimeError("TTS 서버 오류")
     return response.json()["audio_path"]
@@ -91,40 +103,91 @@ def run_tts_audio(filename: str):
 # WebSocket 상호작용
 # ===============================
 @app.websocket("/ws/kiosk")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    for stage in ["status", "stt", "llm", "tts"]:
-        await websocket.send_json({"stage": stage, "text": ""} if stage != "tts" else {"stage": stage, "audio_url": ""})
-
+async def kiosk_ws(ws: WebSocket):
+    await ws.accept()
     try:
         while True:
-            data = await websocket.receive_json()
+            # 클라이언트에서 오는 메시지(JSON). 예:
+            # 1) 하트비트: {"type":"ping"}
+            # 2) 업로드 완료: {"file_id":"..."} 또는 {"type":"audio_uploaded","file_id":"..."}
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # 텍스트가 JSON이 아니면 무시
+                continue
+
+            # 1) 하트비트 처리
+            if data.get("type") == "ping":
+                # 필요하면 pong 회신
+                # await ws.send_json({"type": "pong"})
+                continue
+
+            # 2) 오디오 처리 트리거
             file_id = data.get("file_id")
+            if not file_id and data.get("type") == "audio_uploaded":
+                file_id = data.get("file_id")
+
+            if not file_id:
+                # 기타 메시지는 무시
+                continue
+
+            # ==== STT ====
             audio_path = os.path.join(UPLOAD_DIR, f"{file_id}.wav")
+            await ws.send_json({"stage": "status", "text": "음성 인식 중..."})
+            try:
+                stt_text = await run_in_threadpool(run_stt, audio_path)
+            except Exception as e:
+                await ws.send_json({"stage": "llm", "text": "음성 인식에 실패했어요. 다시 한 번 말씀해 주세요."})
+                # 상황에 따라 바로 다음 턴 대기로 끝
+                continue
 
-            # 1. STT
-            await websocket.send_json({"stage": "status", "text": "음성 인식 중..."})
-            stt_text = await run_in_threadpool(run_stt, audio_path)
-            await websocket.send_json({"stage": "stt", "text": stt_text})
+            await ws.send_json({"stage": "stt", "text": stt_text})
 
-            # 2. Intent LLM
-            await websocket.send_json({"stage": "status", "text": "의도 분석 중..."})
-            plan = await run_in_threadpool(run_llm_intent, stt_text)
-            speak_text = plan.get("speak", "") or "알겠습니다."
-            await websocket.send_json({"stage": "llm", "text": speak_text})
+            # ==== LLM 의도/플랜 ====
+            await ws.send_json({"stage": "status", "text": "의도 분석 중..."})
+            try:
+                result = await run_in_threadpool(run_llm_intent, stt_text)
+                if not isinstance(result, dict):
+                    result = {}
+            except Exception as e:
+                result = {}
 
-            # 3. TTS
-            await websocket.send_json({"stage": "status", "text": "음성 생성 중..."})
-            tts_filename = await run_in_threadpool(run_tts, speak_text)
-            audio_url = f"/ttsaudio/{tts_filename}"
-            await websocket.send_json({"stage": "tts", "audio_url": audio_url})
+            # ==== 액션 해석 (지도 표시 등) ====
+            for act in result.get("actions", []):
+                svc  = act.get("service")
+                name = act.get("name")
+                params = act.get("params", {}) or {}
 
-            # 완료
-            await websocket.send_json({"stage": "status", "text": "처리 완료"})
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        await websocket.close()
+                # 지도/이미지 보여주기
+                if svc == "INFO" and name in ("show_image", "show_map", "map"):
+                    url = params.get("url")
+                    if not url:
+                        key = params.get("map_key")  # "1f", "2f" 등
+                        url = resolve_map_url(key)
+                    await ws.send_json({"stage": "ui", "type": "show_map", "url": url})
+
+            # ==== 말할 응답 ====
+            speak_text = (
+                result.get("speak")
+                or result.get("reply")
+                or "알겠습니다."
+            )
+            await ws.send_json({"stage": "llm", "text": speak_text})
+
+            # ==== TTS ====
+            try:
+                # run_tts는 파일명(또는 경로)을 반환한다고 가정
+                tts_filename = await run_in_threadpool(run_tts, speak_text, 1.0)
+                await ws.send_json({"stage": "tts", "audio_url": f"/ttsaudio/{tts_filename}"})
+            except Exception:
+                # TTS 실패해도 텍스트 응답은 이미 보냈으므로 조용히 무시
+                pass
+
+    except WebSocketDisconnect:
+        # 정상 종료
+        pass
+
 
 # ===============================
 # 채팅 테스트용 엔드포인트
@@ -140,12 +203,13 @@ async def chat_with_llm(chat_request: ChatRequest):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ===============================
-# 인사말 TTS
-# ===============================
-@app.post("/greet")
-def greet(text: str = Body("무엇을 도와드릴까요?")):
-    tts_filename = run_tts(text)
+class TTSRequest(BaseModel):
+    text: str
+    speed: float
+
+@app.post("/request-response")
+def request_tts(request: TTSRequest):
+    tts_filename = run_tts(request.text, request.speed)
     return {"audio_url": f"/ttsaudio/{tts_filename}"}
 
 # ===============================

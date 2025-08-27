@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-OUTPUT_DIR = "/tmp/melotts_output"
+OUTPUT_DIR = "/data/bootcamp/bootcamp/work_ID1/apps.250728_copy/melotts_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 model = TTS(language='KR', device='cuda:0')
@@ -37,7 +37,7 @@ def health():
 async def generate(request: Request):
     data = await request.json()
     text = data.get("text")
-    speed = data.get("speed", 1.0)
+    speed = data.get("speed")
 
     if not text:
         logger.warning("[!] text 필드 없음")
