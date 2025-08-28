@@ -61,11 +61,11 @@ main {
 }
 
 /* convPanel은 flex 아이템으로 설정하고, chat-open 클래스에 따라 flex 비율 조정 */
-#convPanel {
-  flex: 1;
-  display: flex;
-  flex-direction: row;
-  transition: flex 0.5s ease;
+#convPanel{
+  flex: 1;   /* 남는 높이 전부 */
+  min-height:0;   /* 자식 스크롤이 줄어들 수 있게 */
+  display:flex;
+  flex-direction:row;
 }
 
 /* 얼굴 단계 */
@@ -155,11 +155,11 @@ body.chat-open .hint {
 
 /* 채팅 단계 */
 #chatStage{
-  flex: 0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  transition: flex 0.5s ease;
+  flex:0;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
 }
 
 body.chat-open #chatStage {
@@ -172,12 +172,15 @@ body.chat-open #chatStage {
   flex-direction:column;
   gap:12px;
   margin:20px 0px;
-  max-height: 42vh;
   overflow:auto;
   padding-right:8px;
   opacity: 0;
   transition: opacity 0.5s ease 0.5s;
   font-size: 20px;
+  padding-right:8px;
+  padding-bottom:24px;        /* ↓ 바닥 여유 */
+  scroll-behavior:smooth;
+  scroll-padding-bottom:24px; /* scrollIntoView 여유 */
 }
 
 body.chat-open .messages {
@@ -247,31 +250,25 @@ body.chat-open .messages {
     justify-content: flex-end;
 }
 
-/* 큰 패널(지도/정보/호출 영역) */
-#infoPanel {
-  flex-basis: 0;
-  opacity: 0;
-  overflow: hidden;
-  margin: 40px;
-  transition: flex-basis 0.5s ease, opacity 0.5s ease;
-  background: var(--blue);
-  color: var(--white);
-  border-radius: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 24px;
+/* 큰 패널(지도/정보/호출 영역) — 콘텐츠 높이에 맞춰 자동 확장 */
+#infoPanel{
+  flex: 0 0 var(--infoH, 0px);   /* ← 여기만 바꿔도 분할 가능 */
+  opacity:0;
+  overflow:hidden;
+  margin:40px;
+  transition: flex-basis .4s ease, opacity .25s ease;
+  background:var(--blue);
+  color:#fff;
+  border-radius:24px;
+  display:flex; align-items:center; justify-content:center;
 }
-body.chat-open #infoPanel {
-  flex-basis: 50vh;
-  margin: 40px;
-  opacity: 1;
-}
+body.chat-open #infoPanel{ opacity: 1; }  /* height는 JS가 세팅 */
 
 .message {
   opacity: 0;
   transform: scale(0.5) translateY(20px);
   transition: opacity 0.3s ease-in-out, transform 0.3s ease-in-out;
+  scroll-margin-bottom:24px;  /* 마지막 말풍선 살짝 띄우기 */
 }
 
 .message.show {
@@ -303,6 +300,10 @@ body.chat-open #infoPanel {
 }
 
 /* 얼굴 버튼도 살짝 인터랙션 */
-#faceBtn { transition: transform .15s ease; }
 #faceBtn:hover { transform: scale(1.02); }
 #faceBtn:active { transform: scale(0.99); }
+
+/* 보기 좋게 패딩/제목 스타일 (없다면 추가) */
+.panel-pad { width: 100%; padding: 20px 24px; }
+.panel-title { font-size: 22px; font-weight: 700; margin-bottom: 10px; }
+.info-body { line-height: 1.5; }
