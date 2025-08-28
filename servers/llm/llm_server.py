@@ -1,10 +1,9 @@
-# llm_server.py — Qwen 로컬 LLM 인텐트 서버 (FastAPI)
-# 실행 예:
+# llm_server.py — Qwen 기반 인텐트 서버
+# 실행:
 #   conda activate llm-server
 #   CUDA_VISIBLE_DEVICES=0 uvicorn llm_server:app --host 0.0.0.0 --port 9100
 
 import os, re, json, time, logging, threading
-from enum import Enum
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
@@ -20,26 +19,15 @@ log = logging.getLogger("llm_server")
 # ===============================
 # 설정
 # ===============================
-MODEL_NAME  = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")  # VRAM 부족시 7B로
-DEVICE_MAP  = os.environ.get("LLM_DEVICE_MAP", "auto")                   # "auto" 권장
+MODEL_NAME  = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")  # VRAM 여유면 14B도 가능
+DEVICE_MAP  = os.environ.get("LLM_DEVICE_MAP", "auto")
 MAX_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS", "220"))
 
 # ===============================
 # 스키마
 # ===============================
-class Intent(str, Enum):
-    ROUTE_REQUEST = "ROUTE_REQUEST"
-    PLACE_INFO    = "PLACE_INFO"
-    CALL_STAFF    = "CALL_STAFF"
-    TRANSLATE     = "TRANSLATE"
-    SET_LANGUAGE  = "SET_LANGUAGE"
-    SHOW_MAP      = "SHOW_MAP"
-    SMALL_TALK    = "SMALL_TALK"
-    ALARM_EMERGENCY = "ALARM_EMERGENCY"
-    UNKNOWN       = "UNKNOWN"
-
 class IntentResult(BaseModel):
-    intent: Intent = Intent.UNKNOWN
+    intent: str = "UNKNOWN"
     slots: Dict[str, Any] = Field(default_factory=dict)
     actions: List[Dict[str, Any]] = Field(default_factory=list)
     speak: str = "무엇을 도와드릴까요?"
@@ -47,14 +35,6 @@ class IntentResult(BaseModel):
     confidence: float = 0.5
     _raw: Optional[str] = None
 
-class IntentReq(BaseModel):
-    text: str
-    lang: str = "ko"
-    session_id: str = "default"
-
-# ===============================
-# 간단 세션 메모리
-# ===============================
 @dataclass
 class Turn:
     user: str
@@ -86,13 +66,13 @@ class Memory:
 MEM = Memory()
 
 # ===============================
-# 정규화/후처리
+# 정규화/보강
 # ===============================
 def normalize_floor(val: Optional[str]) -> Optional[str]:
     if not val: return None
     t = re.sub(r"\s+", "", str(val).lower())
     table = {
-        "1층":"1f","일층":"1f","lobby":"1f","ground":"1f","1f":"1f",
+        "1층":"1f","일층":"1f","lobby":"1f","1f":"1f",
         "2층":"2f","이층":"2f","2f":"2f",
         "지하1층":"b1","b1":"b1",
     }
@@ -104,42 +84,16 @@ def normalize_floor(val: Optional[str]) -> Optional[str]:
     if m: return f"{int(m.group(1))}f"
     return None
 
-# llm_server.py 中 (기존 postprocess_result를 아래로 교체)
-
 def postprocess_result(r: Dict[str, Any], user_text: str, lang: str="ko") -> Dict[str, Any]:
-    from pydantic import ValidationError
-    try:
-        # 기존 IntentResult 검증 코드가 있다면 그대로 유지
-        pass
-    except ValidationError:
-        pass
-
-    # 층 정규화 유틸 (이미 있다면 재사용)
-    def normalize_floor(val: Optional[str]) -> Optional[str]:
-        import re
-        if not val: return None
-        t = re.sub(r"\s+", "", str(val).lower())
-        tbl = {"1층":"1f","일층":"1f","lobby":"1f","ground":"1f","1f":"1f",
-               "2층":"2f","이층":"2f","2f":"2f",
-               "지하1층":"b1","b1":"b1"}
-        for k,v in tbl.items():
-            if k in t: return v
-        m = re.search(r"(지하|b)\s*(\d+)", t)
-        if m: return f"b{m.group(2)}"
-        m = re.search(r"(\d+)\s*(층|f)", t)
-        if m: return f"{int(m.group(1))}f"
-        return None
-
-    # 표준화
+    # 층 보강
     floor = (r.get("slots") or {}).get("floor")
-    floor = normalize_floor(floor) or normalize_floor(user_text)
-    if floor:
-        r.setdefault("slots", {})["floor"] = floor
+    nf = normalize_floor(floor) or normalize_floor(user_text)
+    if nf:
+        r.setdefault("slots", {})["floor"] = nf
 
-    # ★ SHOW_MAP 처리
+    # SHOW_MAP 보강
     if r.get("intent") == "SHOW_MAP":
-        # 층이 없는 경우 → 층 선택 UI + 질문 멘트
-        if not floor:
+        if not nf:
             prompt = "지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?"
             r["speak"] = r.get("speak") or prompt
             r["ask_user"] = r.get("ask_user") or prompt
@@ -152,50 +106,42 @@ def postprocess_result(r: Dict[str, Any], user_text: str, lang: str="ko") -> Dic
                 }
             })
         else:
-            # 층이 있으면 show_map 보장
             has_map = any(a.get("service")=="INFO" and a.get("name") in ("show_map","show_image","map")
                           for a in r.get("actions", []))
             if not has_map:
                 r.setdefault("actions", []).append({
-                    "service":"INFO","name":"show_map","params":{"map_key": floor}
+                    "service":"INFO","name":"show_map","params":{"map_key": nf}
                 })
             else:
                 for a in r["actions"]:
                     if a.get("service")=="INFO" and a.get("name") in ("show_map","show_image","map"):
-                        a.setdefault("params", {}).setdefault("map_key", floor)
+                        a.setdefault("params", {}).setdefault("map_key", nf)
             if not r.get("speak"):
-                if floor.endswith("f") and floor[:-1].isdigit():
-                    r["speak"] = f"{int(floor[:-1])}층 지도를 보여드릴게요."
-                elif floor.startswith("b") and floor[1:].isdigit():
-                    r["speak"] = f"지하 {int(floor[1:])}층 지도를 보여드릴게요."
+                if nf.endswith("f") and nf[:-1].isdigit():
+                    r["speak"] = f"{int(nf[:-1])}층 지도를 보여드릴게요."
+                elif nf.startswith("b") and nf[1:].isdigit():
+                    r["speak"] = f"지하 {int(nf[1:])}층 지도를 보여드릴게요."
                 else:
                     r["speak"] = "지도를 보여드릴게요."
-
-    # 나머지 인텐트 보강(필요 시 기존 로직 유지)
     return r
 
 # ===============================
-# 메시지/프롬프트
+# 시스템 프롬프트
 # ===============================
-SYSTEM_PROMPT = """You are an intent parser for a kiosk in Korean named "에스뽀" (Esppo).
+SYSTEM_PROMPT = """You are an intent parser for a kiosk in Korean named "에스뽀".
 Return ONLY strict JSON with keys: intent, slots, actions, speak, ask_user, confidence.
 - intent ∈ [SHOW_MAP, ROUTE_REQUEST, PLACE_INFO, CALL_STAFF, TRANSLATE, SET_LANGUAGE, SMALL_TALK, ALARM_EMERGENCY, UNKNOWN]
-- slots may include: floor ('1f','2f','b1'...), destination/to, from, lang ('ko','en','ja','zh','es','fr','vi','th'...)
-- actions: array of {service, name, params}. For SHOW_MAP include params.map_key normalized like floor if possible.
-- speak: short reply (<=20 words) in the SAME LANGUAGE as the user's utterance.
-- ask_user: if info is missing, one clarifying question in the user's language; else empty string.
+- slots may include: floor ('1f','2f','b1'...), destination/to, from, lang ('ko','en','ja','zh'...)
+- actions: array of {service, name, params}. For SHOW_MAP include params.map_key if possible.
+- speak: short, kind, and cheerful reply (<=40 words) in the SAME LANGUAGE as the user's utterance.
+- ask_user: if info is missing, one cute and friendly clarifying question in the user's language; else empty.
 - confidence: 0..1 number.
 
-Name & language rules:
-- Your name is "에스뽀". If the user greets or calls your name, treat it as SMALL_TALK and reply briefly in the user's language.
-- Auto-detect the user's language from the utterance. If the user speaks in a foreign language, reply in that language and set slots.lang with an ISO-like code (ko, en, ja, zh, etc.).
-- If the user explicitly asks to change the UI language, intent=SET_LANGUAGE and normalize slots.lang accordingly (ko, en, ja, zh, es, fr, vi, th).
-
-Disambiguation examples (guidance):
-- If asked to "show map" without a floor, DO NOT guess a floor. Put ask_user like "지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?" and omit actions or provide SHOW_MAP without map_key until clarified.
-- Keep all texts concise and polite.
-
-Output JSON only, no code fences.
+Rules:
+- Your name is "에스뽀". If user uses another language, answer in that language.
+- If asked "show map" without a floor, DO NOT guess. Ask which floor (B1~10F) and propose a floor choice UI.
+- Your personality is like a very friendly, cute, and helpful friend! Please end your sentences with cute endings like `~용`, `~죠`, `~뿅!`, or `~이요`. Use emojis often!
+- Output JSON only, no code fences.
 """
 
 FEW_SHOTS = [
@@ -204,45 +150,37 @@ FEW_SHOTS = [
         "slots":{"floor":"1f"},
         "speak":"1층 지도를 보여드릴게요.",
         "ask_user":"",
-        "confidence":0.85,
+        "confidence":0.9,
         "actions":[{"service":"INFO","name":"show_map","params":{"map_key":"1f"}}]
     }),
-    ('"2층 안내"', "ko", {
+    ('"지도"', "ko", {
         "intent":"SHOW_MAP",
-        "slots":{"floor":"2f"},
-        "speak":"2층 지도를 보여드릴게요.",
-        "ask_user":"",
-        "confidence":0.85,
-        "actions":[{"service":"INFO","name":"show_map","params":{"map_key":"2f"}}]
+        "slots":{},
+        "speak":"지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?",
+        "ask_user":"지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?",
+        "confidence":0.8,
+        "actions":[{"service":"UI","name":"choose_floor","params":{"floors":["b1"]+[f"{i}f" for i in range(1,11)],"prompt":"지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?"}}]
     }),
     ('"영어로 바꿔줘"', "ko", {
         "intent":"SET_LANGUAGE",
         "slots":{"lang":"en"},
         "speak":"화면 언어를 영어로 바꿀게요.",
         "ask_user":"",
-        "confidence":0.9,
+        "confidence":0.95,
         "actions":[{"service":"UI","name":"set_lang","params":{"lang":"en"}}]
     }),
 ]
 
-def build_messages(user: str, lang: str, ctx: List[Turn]) -> List[Dict[str,str]]:
-    # 최근 문맥 요약(필요하면 사용)
-    ctx_lines=[]
-    for t in ctx[-4:]:
-        try:
-            ctx_lines.append(f"- intent={t.result.intent}, slots={json.dumps(t.result.slots, ensure_ascii=False)}")
-        except: pass
-    ctx_text="\n".join(ctx_lines) if ctx_lines else "(none)"
-
-    msgs=[{"role":"system","content": SYSTEM_PROMPT + f"\n[State] ui_lang={lang}\n[RecentTurns]\n{ctx_text}\n[Output] JSON only."}]
+def build_messages(user: str) -> List[Dict[str,str]]:
+    msgs=[{"role":"system","content": SYSTEM_PROMPT}]
     for q,ql,outj in FEW_SHOTS:
         msgs.append({"role":"user","content": f"[lang={ql}] {q}"})
         msgs.append({"role":"assistant","content": json.dumps(outj, ensure_ascii=False)})
-    msgs.append({"role":"user","content": f"[lang={lang}] \"{user}\""})
+    msgs.append({"role":"user","content": user})
     return msgs
 
 # ===============================
-# Qwen 로딩/호출
+# 모델 로딩
 # ===============================
 log.info(f"Loading model: {MODEL_NAME} (device_map={DEVICE_MAP})")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -260,7 +198,6 @@ def apply_chat_template(messages: List[Dict[str,str]]) -> str:
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
-        # 일반 모델 대비 폴백
         txt=""
         for m in messages:
             txt += f"<|{m['role']}|>\n{m['content'].strip()}\n"
@@ -277,16 +214,12 @@ def call_llm(prompt: str) -> str:
             terminators.append(im_end)
     except Exception:
         pass
-
     out = gen(prompt, max_new_tokens=MAX_TOKENS, do_sample=False, temperature=0.0, top_p=1.0,
               eos_token_id=terminators if terminators else None)
     text = out[0]["generated_text"]
     if text.startswith(prompt): text = text[len(prompt):]
     return text.strip()
 
-# ===============================
-# JSON 파싱 유틸
-# ===============================
 def extract_json_block(s: str) -> str:
     if not s: return s
     s = s.replace("```json","").replace("```","").strip()
@@ -322,37 +255,19 @@ def coerce_result(obj: Dict[str, Any]) -> IntentResult:
         log.warning(f"coerce_result validation fail: {e}")
         return IntentResult()
 
-def run_intent_llm(user: str, lang: str, ctx: List[Turn]) -> IntentResult:
-    messages = build_messages(user, lang, ctx)
-    prompt = apply_chat_template(messages)
-    raw = call_llm(prompt)
-    log.info(f"[LLM raw] {raw[:400]}{'...' if len(raw)>400 else ''}")
-
-    # 1차 파싱
-    try:
-        block = extract_json_block(raw)
-        data = json.loads(block)
-        res = coerce_result(data)
-        res._raw = raw
-        return res
-    except Exception as e1:
-        log.warning(f"[1st parse fail] {e1}")
-
-    # 2차: 복구 프롬프트
-    repair_msgs = [
-        {"role":"system","content":"Fix to valid JSON. Output JSON ONLY. Keys: intent, slots, actions, speak, ask_user, confidence"},
-        {"role":"user","content": raw}
-    ]
-    raw2 = call_llm(apply_chat_template(repair_msgs))
-    try:
-        block = extract_json_block(raw2)
-        data = json.loads(block)
-        res = coerce_result(data)
-        res._raw = raw
-        return res
-    except Exception as e2:
-        log.error(f"[2nd parse fail] {e2}")
-        return IntentResult(_raw=raw)
+# ── 금관 콘텐츠(LLM이 내려줌: title/url/desc + 긴설명 TTS 액션)
+GEUMGWAN = {
+    "title": "금관",
+    "url": "/artifacts/geumgwan.png",
+    "desc": (
+        "이 금관은 신라의 왕권과 종교적 상징을 함께 담은 대표 유물입니다. "
+        "사슴뿔 모양의 가지 장식과 나뭇가지 모양의 수식이 위로 뻗어 하늘과의 연결을 표현하고, "
+        "얇은 금판을 오려 만든 세공과 옥으로 장식된 곁가지가 섬세합니다. "
+        "착용은 일상용이라기보다 의례나 장송 의식에서 사용된 것으로 추정됩니다. "
+        "순금판을 얇게 가공해 무게를 줄였고, 금실과 구슬 장식은 움직일 때마다 빛과 소리를 냈습니다. "
+        "정치·종교·예술이 결합된 신라 문화의 정수를 보여줍니다."
+    )
+}
 
 # ===============================
 # FastAPI
@@ -370,14 +285,66 @@ def health():
 @app.post("/intent")
 async def intent(req: Request):
     data = await req.json()
-    text = data.get("text","")
-    lang = data.get("lang","ko")
+    text = (data.get("text") or "").strip()
     sid  = data.get("session_id","default")
 
-    ctx = MEM.get_context(sid)
-    res = run_intent_llm(text, lang, ctx)
+    # 1) LLM 호출
+    messages = build_messages(text)
+    prompt   = apply_chat_template(messages)
+    raw      = call_llm(prompt)
+
+    # 2) 1차 파싱
+    try:
+        block = extract_json_block(raw)
+        obj   = json.loads(block)
+        res   = coerce_result(obj)
+        res._raw = raw
+    except Exception as e1:
+        # 3) 복구 프롬프트 (간단)
+        repair_msgs = [
+            {"role":"system","content":"Fix to valid JSON. Output JSON ONLY. Keys: intent, slots, actions, speak, ask_user, confidence"},
+            {"role":"user","content": raw}
+        ]
+        raw2 = call_llm(apply_chat_template(repair_msgs))
+        try:
+            block = extract_json_block(raw2)
+            obj   = json.loads(block)
+            res   = coerce_result(obj)
+            res._raw = raw
+        except Exception as e2:
+            log.error(f"[parse fail] {e1} / {e2}")
+            res = IntentResult()
+
+    # 4) 후처리 보강(층 선택, map_key 등)
     res_dict = res.model_dump()
-    res_dict = postprocess_result(res_dict, text, lang)   # ★ 층수/액션 보강
+    res_dict = postprocess_result(res_dict, text, "ko")
+
+    # 5) 금관 시나리오(규칙 보강): “정보/설명” → 선택 패널, “금관” → 이미지+긴 설명 TTS
+    t = text.lower()
+    if any(k in t for k in ["정보","설명","안내","explain","info"]) and not any(a.get("name")=="choice" for a in res_dict.get("actions",[])):
+        res_dict.setdefault("actions", []).append({
+            "service":"UI","name":"choice",
+            "params":{
+                "title":"정보",
+                "prompt":"무엇을 설명해드릴까요?",
+                "options":[{"label":"금관","say":"금관 설명해줘"}]
+            }
+        })
+        res_dict["speak"] = res_dict.get("speak") or "무엇을 설명해드릴까요?"
+
+    if any(k in t for k in ["금관","geumgwan","gold crown","金冠"]):
+        if not any(a.get("name")=="show_artifact" for a in res_dict.get("actions",[])):
+            res_dict.setdefault("actions", []).append({
+                "service":"INFO","name":"show_artifact",
+                "params":{"title":GEUMGWAN["title"],"url":GEUMGWAN["url"],"desc":GEUMGWAN["desc"]}
+            })
+        if not any(a.get("name")=="speak_detail" for a in res_dict.get("actions",[])):
+            res_dict.setdefault("actions", []).append({
+                "service":"TTS","name":"speak_detail","params":{"text": GEUMGWAN["desc"]}
+            })
+        res_dict["speak"] = res_dict.get("speak") or "금관에 대해 알려드릴게요."
+
+    # 6) 메모리 저장
     MEM.put(sid, text, IntentResult(**res_dict))
     return JSONResponse(res_dict)
 
