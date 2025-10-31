@@ -1,4 +1,4 @@
-# main.py
+# main.py — Kiosk backend: WS 파이프라인 + 멀티랭 TTS 연동
 import os, uuid, json, shutil, glob, logging, requests
 from typing import Optional, Dict, Any
 
@@ -22,7 +22,7 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# 유물/이미지: ./artifacts 를 /artifacts 로 서빙
+# 유물/이미지: ./artifacts 를 /artifacts 로 서빙 (금관 파일 등)
 ARTIFACT_DIR = os.path.join(BASE_DIR, "artifacts")
 if os.path.isdir(ARTIFACT_DIR):
     app.mount("/artifacts", StaticFiles(directory=ARTIFACT_DIR), name="artifacts")
@@ -43,12 +43,13 @@ TTS_SERVER_URL    = os.environ.get("TTS_URL",   "http://localhost:9200")
 NOTIFY_SERVER_URL = os.environ.get("NOTIFY_URL","http://localhost:9300")
 NAV_SERVER_URL    = os.environ.get("NAV_URL",   "")
 
-# ── 지도 리소스 매핑
+# ── 지도 매핑
 MAP_FILES = {
     "default": "venue_map.png",
     "b1": "b1.png",
     "1f": "floor1.png",
     "2f": "floor2.png",
+    "3f": "floor3.png",
 }
 def resolve_map_url(key: Optional[str]) -> str:
     k = (key or "default").lower().replace(" ", "")
@@ -94,20 +95,21 @@ def run_llm_intent(user_text: str) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json()
 
-def tts_make_audio_url(text: str, speed: float = 1.0) -> str:
+def tts_make_audio_url(text: str, speed: float = 1.0, lang: str = "ko") -> str:
     try:
-        r = requests.post(f"{TTS_SERVER_URL}/tts", json={"text": text, "speed": speed}, timeout=30)
+        r = requests.post(
+            f"{TTS_SERVER_URL}/tts",
+            json={"text": text, "speed": speed, "lang": lang},
+            timeout=30
+        )
         r.raise_for_status()
         data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-        # 서버가 파일명을 주는 경우
-        if data.get("filename"):         # 예: "abcd.wav"
-            return f"/ttsaudio/{data['filename']}"
-        # 서버가 로컬 경로를 주는 경우
-        if data.get("audio_path"):       # 예: "./melotts_output/abcd.wav"
-            return f"/ttsaudio/{os.path.basename(data['audio_path'])}"
-        # 외부 URL 그대로 재생
         if data.get("audio_url"):
             return data["audio_url"]
+        if data.get("filename"):
+            return f"/ttsaudio/{data['filename']}"
+        if data.get("audio_path"):
+            return f"/ttsaudio/{os.path.basename(data['audio_path'])}"
     except Exception as e:
         log.warning("TTS error: %s", e)
     return ""
@@ -127,7 +129,6 @@ def run_nav_route(src: Optional[str], dst: Optional[str]) -> Dict[str, Any]:
             if r.ok: return r.json()
         except Exception as e:
             log.warning("nav server failed, fallback: %s", e)
-    # 폴백
     steps = []
     if src: steps.append({"text": f"{src}에서 출발"})
     if dst:
@@ -153,13 +154,15 @@ async def request_response(req: Request):
     data = await req.json()
     text  = data.get("text", "")
     speed = float(data.get("speed", 1.0) or 1.0)
-    url = await run_in_threadpool(tts_make_audio_url, text, speed)
+    lang  = (data.get("lang") or "ko")
+    url = await run_in_threadpool(tts_make_audio_url, text, speed, lang)
     return JSONResponse({"audio_url": url})
 
 # ── WebSocket 파이프라인
 @app.websocket("/ws/kiosk")
 async def kiosk_ws(ws: WebSocket):
     await ws.accept()
+    session_lang = "ko"  # 기본 언어(한국어)
     try:
         while True:
             raw = await ws.receive_text()
@@ -168,13 +171,75 @@ async def kiosk_ws(ws: WebSocket):
             except json.JSONDecodeError:
                 continue
 
-            # 하트비트
+            # 핑
             if data.get("type") == "ping":
                 continue
 
-            # (좌측 버튼) 가짜 유저 발화
+            # 세션 언어 업데이트 헬퍼
+            def update_lang_from_result(result: dict):
+                nonlocal session_lang
+                slot_lang = (result.get("slots") or {}).get("lang")
+                if slot_lang:
+                    session_lang = slot_lang  # ko/en/ja/zh
+
+            # 공통 액션 처리
+            async def handle_action(act: Dict[str, Any], result: Dict[str, Any]):
+                nonlocal session_lang
+                svc    = act.get("service")
+                name   = act.get("name")
+                params = (act.get("params") or {})
+
+                if svc == "UI" and name == "choose_floor":
+                    await ws.send_json({
+                        "stage":"ui","type":"choose_floor",
+                        "floors": params.get("floors") or ["b1"]+[f"{i}f" for i in range(1,11)],
+                        "prompt": params.get("prompt","")
+                    })
+
+                if svc == "UI" and name == "choice":
+                    await ws.send_json({
+                        "stage":"ui","type":"choice",
+                        "title": params.get("title",""),
+                        "prompt": params.get("prompt",""),
+                        "options": params.get("options",[])
+                    })
+
+                if svc == "INFO" and name in ("show_image","show_map","map"):
+                    url = params.get("url") or resolve_map_url(params.get("map_key"))
+                    await ws.send_json({"stage":"ui","type":"show_map","url": url})
+
+                if svc == "INFO" and name in ("place_info","show_info"):
+                    text = params.get("text") or result.get("speak") or ""
+                    await ws.send_json({"stage":"ui","type":"show_info","html": text})
+
+                if svc == "INFO" and name == "show_artifact":
+                    await ws.send_json({"stage":"ui","type":"show_artifact",
+                                        "title": params.get("title",""),
+                                        "url": params.get("url",""),
+                                        "desc": params.get("desc","")})
+
+                if svc == "NAV" and name == "plan_route":
+                    route = await run_in_threadpool(run_nav_route, params.get("from"), params.get("to"))
+                    await ws.send_json({"stage":"ui","type":"nav_route","route": route})
+
+                if svc == "CALL" and name in ("notify_staff","notify_security"):
+                    ok = await run_in_threadpool(run_notify_staff, {"type":name, "meta":params})
+                    await ws.send_json({"stage":"ui","type":"call_staff_ack","ok": bool(ok)})
+
+                if svc in ("UI","INFO") and name in ("set_lang","change_lang","set_language"):
+                    lang = params.get("lang") or (result.get("slots") or {}).get("lang") or "ko"
+                    session_lang = lang
+                    await ws.send_json({"stage":"ui","type":"set_lang","lang": lang})
+
+                if svc == "TTS" and name == "speak_detail":
+                    long_txt = (params.get("text") or "").strip()
+                    if long_txt:
+                        url = await run_in_threadpool(tts_make_audio_url, long_txt, 1.0, session_lang)
+                        if url: await ws.send_json({"stage":"tts","audio_url": url})
+
+            # 좌측 버튼 → 가짜 유저 발화
             if data.get("type") == "synthetic_text":
-                stt_text = (data.get("text") or "").trim() if hasattr(str, "trim") else (data.get("text") or "").strip()
+                stt_text = (data.get("text") or "").strip()
                 if not stt_text: continue
                 await ws.send_json({"stage":"stt","text": stt_text})
                 await ws.send_json({"stage":"status","text":"의도 분석 중..."})
@@ -183,57 +248,21 @@ async def kiosk_ws(ws: WebSocket):
                 except Exception:
                     result = {"intent":"UNKNOWN","actions":[],"speak":"이해하지 못했어요.","ask_user":"", "slots":{}, "confidence":0.2}
 
-                # 액션 처리
+                update_lang_from_result(result)
+
                 for act in result.get("actions", []):
-                    svc    = act.get("service")
-                    name   = act.get("name")
-                    params = (act.get("params") or {})
+                    await handle_action(act, result)
 
-                    if svc == "UI" and name == "choose_floor":
-                        await ws.send_json({"stage":"ui","type":"choose_floor",
-                                            "floors": params.get("floors") or ["b1"]+[f"{i}f" for i in range(1,11)],
-                                            "prompt": params.get("prompt","")})
-                    if svc == "UI" and name == "choice":
-                        await ws.send_json({"stage":"ui","type":"choice",
-                                            "title": params.get("title",""), "prompt": params.get("prompt",""),
-                                            "options": params.get("options",[])})
-                    if svc == "INFO" and name in ("show_image","show_map","map"):
-                        url = params.get("url") or resolve_map_url(params.get("map_key"))
-                        await ws.send_json({"stage":"ui","type":"show_map","url": url})
-                    if svc == "INFO" and name in ("place_info","show_info"):
-                        text = params.get("text") or result.get("speak") or ""
-                        await ws.send_json({"stage":"ui","type":"show_info","html": text})
-                    if svc == "INFO" and name == "show_artifact":
-                        await ws.send_json({"stage":"ui","type":"show_artifact",
-                                            "title": params.get("title",""),
-                                            "url": params.get("url",""),
-                                            "desc": params.get("desc","")})
-                    if svc == "NAV" and name == "plan_route":
-                        route = await run_in_threadpool(run_nav_route, params.get("from"), params.get("to"))
-                        await ws.send_json({"stage":"ui","type":"nav_route","route": route})
-                    if svc == "CALL" and name in ("notify_staff","notify_security"):
-                        ok = await run_in_threadpool(run_notify_staff, {"type":name, "meta":params})
-                        await ws.send_json({"stage":"ui","type":"call_staff_ack","ok": bool(ok)})
-                    if svc in ("UI","INFO") and name in ("set_lang","change_lang","set_language"):
-                        lang = params.get("lang") or result.get("slots",{}).get("lang") or "ko"
-                        await ws.send_json({"stage":"ui","type":"set_lang","lang": lang})
-                    if svc == "TTS" and name == "speak_detail":
-                        long_txt = (params.get("text") or "").strip()
-                        if long_txt:
-                            url = await run_in_threadpool(tts_make_audio_url, long_txt, 1.0)
-                            if url: await ws.send_json({"stage":"tts","audio_url": url})
-
-                # 짧은 응답 + 기본 TTS
                 speak_text = result.get("speak") or result.get("reply") or "알겠습니다."
                 await ws.send_json({"stage":"llm","text": speak_text, "user_text": stt_text})
                 try:
-                    url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0)
+                    url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0, session_lang)
                     if url: await ws.send_json({"stage":"tts","audio_url": url})
                 except Exception:
                     pass
                 continue
 
-            # 층 선택 패널에서 온 클릭
+            # 층 선택 패널 클릭
             if data.get("type") == "select_floor":
                 key = (data.get("map_key") or "").lower().strip()
                 if key:
@@ -246,7 +275,7 @@ async def kiosk_ws(ws: WebSocket):
                     await ws.send_json({"stage":"ui","type":"show_map","url": url})
                     speak_text = f"{label} 지도를 보여드릴게요."
                     await ws.send_json({"stage":"llm","text": speak_text, "user_text": ""})
-                    tts_url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0)
+                    tts_url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0, session_lang)
                     if tts_url:
                         await ws.send_json({"stage":"tts","audio_url": tts_url})
                 continue
@@ -260,7 +289,7 @@ async def kiosk_ws(ws: WebSocket):
             if not upath:
                 err_text = "업로드된 음성을 찾지 못했습니다. 다시 말씀해 주세요."
                 await ws.send_json({"stage":"llm","text": err_text, "user_text": ""})
-                url = await run_in_threadpool(tts_make_audio_url, err_text, 1.0)
+                url = await run_in_threadpool(tts_make_audio_url, err_text, 1.0, session_lang)
                 if url: await ws.send_json({"stage":"tts","audio_url": url})
                 continue
 
@@ -273,7 +302,7 @@ async def kiosk_ws(ws: WebSocket):
             if not stt_text:
                 err_text = "음성 인식에 실패했어요. 다시 말씀해 주세요."
                 await ws.send_json({"stage":"llm","text": err_text, "user_text": stt_text})
-                url = await run_in_threadpool(tts_make_audio_url, err_text, 1.0)
+                url = await run_in_threadpool(tts_make_audio_url, err_text, 1.0, session_lang)
                 if url: await ws.send_json({"stage":"tts","audio_url": url})
                 continue
 
@@ -284,50 +313,14 @@ async def kiosk_ws(ws: WebSocket):
             except Exception:
                 result = {"intent":"UNKNOWN","actions":[],"speak":"이해하지 못했어요.","ask_user":"", "slots":{}, "confidence":0.2}
 
-            # 액션 처리
+            update_lang_from_result(result)
+
             for act in result.get("actions", []):
-                svc    = act.get("service")
-                name   = act.get("name")
-                params = (act.get("params") or {})
+                await handle_action(act, result)
 
-                if svc == "UI" and name == "choose_floor":
-                    await ws.send_json({"stage":"ui","type":"choose_floor",
-                                        "floors": params.get("floors") or ["b1"]+[f"{i}f" for i in range(1,11)],
-                                        "prompt": params.get("prompt","")})
-                if svc == "UI" and name == "choice":
-                    await ws.send_json({"stage":"ui","type":"choice",
-                                        "title": params.get("title",""), "prompt": params.get("prompt",""),
-                                        "options": params.get("options",[])})
-                if svc == "INFO" and name in ("show_image","show_map","map"):
-                    url = params.get("url") or resolve_map_url(params.get("map_key") or guess_floor_key(stt_text))
-                    await ws.send_json({"stage":"ui","type":"show_map","url": url})
-                if svc == "INFO" and name in ("place_info","show_info"):
-                    text = params.get("text") or result.get("speak") or ""
-                    await ws.send_json({"stage":"ui","type":"show_info","html": text})
-                if svc == "INFO" and name == "show_artifact":
-                    await ws.send_json({"stage":"ui","type":"show_artifact",
-                                        "title": params.get("title",""),
-                                        "url": params.get("url",""),
-                                        "desc": params.get("desc","")})
-                if svc == "NAV" and name == "plan_route":
-                    route = await run_in_threadpool(run_nav_route, params.get("from"), params.get("to"))
-                    await ws.send_json({"stage":"ui","type":"nav_route","route": route})
-                if svc == "CALL" and name in ("notify_staff","notify_security"):
-                    ok = await run_in_threadpool(run_notify_staff, {"type":name, "meta":params})
-                    await ws.send_json({"stage":"ui","type":"call_staff_ack","ok": bool(ok)})
-                if svc in ("UI","INFO") and name in ("set_lang","change_lang","set_language"):
-                    lang = params.get("lang") or "ko"
-                    await ws.send_json({"stage":"ui","type":"set_lang","lang": lang})
-                if svc == "TTS" and name == "speak_detail":
-                    long_txt = (params.get("text") or "").strip()
-                    if long_txt:
-                        url = await run_in_threadpool(tts_make_audio_url, long_txt, 1.0)
-                        if url: await ws.send_json({"stage":"tts","audio_url": url})
-
-            # 짧은 응답 + 기본 TTS
             speak_text = result.get("speak") or result.get("reply") or "알겠습니다."
             await ws.send_json({"stage":"llm","text": speak_text, "user_text": stt_text})
-            url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0)
+            url = await run_in_threadpool(tts_make_audio_url, speak_text, 1.0, session_lang)
             if url:
                 await ws.send_json({"stage":"tts","audio_url": url})
 

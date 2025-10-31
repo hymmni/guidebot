@@ -1,0 +1,617 @@
+
+'use strict';
+
+/* ======================================================
+  * 상수/DOM 참조
+  * ====================================================== */
+const BASE = location.origin;
+const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/kiosk";
+
+const body = document.body;
+const faceBtn = document.getElementById('faceBtn');
+const messages = document.getElementById('messages');
+const player = document.getElementById('player');
+const infoPanel = document.getElementById('infoPanel');
+
+const btnMap = document.getElementById('btnMap');
+const btnInfo = document.getElementById('btnInfo');
+const btnCall = document.getElementById('btnCall');
+const btnLang = document.getElementById('btnLang');
+
+/* ======================================================
+  * 말풍선 유틸
+  * ====================================================== */
+function scrollMessagesBottom() { messages.scrollTop = messages.scrollHeight; }
+function bubble(el) {
+    messages.appendChild(el);
+    requestAnimationFrame(() => {
+        el.classList.add('show');
+        const done = () => { el.removeEventListener('transitionend', done); requestAnimationFrame(scrollMessagesBottom); };
+        el.addEventListener('transitionend', done);
+        setTimeout(done, 420);
+    });
+}
+function displayBotResponse(text) {
+    const el = document.createElement('div');
+    el.className = 'message bBubble bot-bubble';
+    el.textContent = text;
+    bubble(el);
+}
+let lastShownUserText = "";
+function displayUserMessage(text) {
+    const t = (text || "").trim();
+    if (!t) return;
+    if (t === lastShownUserText) return;
+    lastShownUserText = t;
+    const el = document.createElement('div');
+    el.className = 'message uBubble user-bubble';
+    el.textContent = t;
+    bubble(el);
+}
+
+/* ======================================================
+  * infoPanel 크기 제어 (50vh 상한, 내용 높이 기준)
+  * ====================================================== */
+let __ro = null, __mo = null, __heightTimer = null;
+function clampPanelPx(h) { const maxH = Math.round(window.innerHeight * 0.5); return Math.max(0, Math.min((h | 0), maxH)); }
+function measurePanelPx() { const pad = infoPanel.querySelector('.panel-pad'); return pad ? (pad.scrollHeight + 2) : 0; }
+function applyPanelFlexHeight(px) {
+    const h = clampPanelPx(px != null ? px : measurePanelPx());
+    infoPanel.style.setProperty('--infoH', `${h}px`);
+    infoPanel.style.height = `${h}px`;         // 일부 브라우저 보조
+    requestAnimationFrame(scrollMessagesBottom);
+}
+function samplePanelHeightOverTime() {
+    if (__heightTimer) clearTimeout(__heightTimer);
+    let count = 0, last = -1;
+    const step = () => {
+        const h = clampPanelPx(measurePanelPx());
+        if (h !== last) { infoPanel.style.setProperty('--infoH', `${h}px`); infoPanel.style.height = `${h}px`; last = h; }
+        count++; if (count < 10) { __heightTimer = setTimeout(step, 30); }
+    };
+    step();
+}
+function bindPanelObservers() {
+    const pad = infoPanel.querySelector('.panel-pad');
+    if (!pad) return;
+    if (__ro) { try { __ro.disconnect(); } catch { } __ro = null; }
+    if (__mo) { try { __mo.disconnect(); } catch { } __mo = null; }
+    __ro = new ResizeObserver(() => samplePanelHeightOverTime()); __ro.observe(pad);
+    __mo = new MutationObserver(() => samplePanelHeightOverTime());
+    __mo.observe(pad, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'style', 'class'] });
+
+    pad.querySelectorAll('img,video').forEach(el => {
+        const fire = () => samplePanelHeightOverTime();
+        if (el.tagName === 'IMG') { if (!el.complete) el.addEventListener('load', fire, { once: true }); else setTimeout(fire, 0); }
+        else if (el.tagName === 'VIDEO') { if (el.readyState < 2) el.addEventListener('loadeddata', fire, { once: true }); else setTimeout(fire, 0); }
+    });
+
+    window.addEventListener('resize', samplePanelHeightOverTime, { passive: true });
+    samplePanelHeightOverTime();
+}
+function unbindPanelObservers() {
+    if (__ro) { try { __ro.disconnect(); } catch { } __ro = null; }
+    if (__mo) { try { __mo.disconnect(); } catch { } __mo = null; }
+    if (__heightTimer) { clearTimeout(__heightTimer); __heightTimer = null; }
+    window.removeEventListener('resize', samplePanelHeightOverTime);
+}
+function setPanelHTML(html) {
+    body.classList.add('chat-open');
+    infoPanel.innerHTML = html || '';
+    infoPanel.style.opacity = '1';
+    bindPanelObservers();
+    applyPanelFlexHeight();
+}
+function clearPanel() {
+    infoPanel.innerHTML = '';
+    infoPanel.style.setProperty('--infoH', '0px');
+    infoPanel.style.height = '0px';
+    infoPanel.style.opacity = '0';
+    unbindPanelObservers();
+}
+
+/* ======================================================
+  * 이미지 패널 (지도/유물) — 잘림 없이 contain, 50vh 내로 맞춤
+  * ====================================================== */
+function fitImageBox(img, box, pad, titleSel = '.panel-title') {
+    if (!img || !box || !pad) return;
+    const title = pad.querySelector(titleSel);
+    const titleH = title ? Math.ceil(title.getBoundingClientRect().height) : 0;
+    const cs = getComputedStyle(pad);
+    const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+    const chrome = titleH + padV + 16;
+
+    const panelMaxH = Math.round(window.innerHeight * 0.5);
+    const availH = Math.max(140, panelMaxH - chrome);
+
+    const padW = pad.clientWidth || box.clientWidth || infoPanel.clientWidth;
+    const nW = img.naturalWidth || img.width;
+    const nH = img.naturalHeight || img.height;
+    if (!nW || !nH || !padW) { samplePanelHeightOverTime(); return; }
+
+    const fitWidthH = padW * (nH / nW);
+    const targetH = Math.max(140, Math.min(fitWidthH, availH));
+    box.style.height = `${Math.round(targetH)}px`;
+
+    applyPanelFlexHeight();
+}
+
+function showMap(url) {
+    setPanelHTML(`
+<div class="panel-pad">
+    <div class="panel-title">지도</div>
+    <div id="mapBox" style="width:100%;display:flex;justify-content:center;align-items:center;">
+        <img id="mapImg" src="${url}" alt="지도"
+            style="display:block;width:100%;height:100%;object-fit:contain;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.08);" />
+    </div>
+</div>
+    `);
+    const img = infoPanel.querySelector('#mapImg');
+    const box = infoPanel.querySelector('#mapBox');
+    const pad = infoPanel.querySelector('.panel-pad');
+    const run = () => fitImageBox(img, box, pad);
+    if (img.complete) run(); else img.addEventListener('load', run, { once: true });
+    window.addEventListener('resize', run, { passive: true });
+}
+
+/* 이미지+설명: 좌우 2열 레이아웃 */
+function showArtifact(title, url, desc) {
+    setPanelHTML(`
+<div class="panel-pad">
+    <div class="panel-title">${title || '유물'}</div>
+    <div class="artifact-row">
+        <div id="artLeft" class="artifact-imgbox">
+            <img id="artImg" src="${url}" alt="${title || 'artifact'}" />
+        </div>
+        <div id="artRight" class="artifact-desc">
+            ${(desc || '').replace(/\n/g, '<br/>')}
+        </div>
+    </div>
+</div>
+`);
+
+    const img = infoPanel.querySelector('#artImg');
+    const left = infoPanel.querySelector('#artLeft');
+    const pad = infoPanel.querySelector('.panel-pad');
+
+    const run = () => fitArtifactRow(img, left, pad);
+    if (img.complete) run(); else img.addEventListener('load', run, { once: true });
+    window.addEventListener('resize', run, { passive: true });
+}
+
+/* 좌우 배치에 맞춰 패널 높이/이미지 박스 높이 계산
+    - 패널 전체는 50vh 이내로 제한
+    - 왼쪽 이미지는 contain, 오른쪽 설명은 내부 스크롤
+*/
+function fitArtifactRow(img, leftBox, pad) {
+    if (!img || !leftBox || !pad) return;
+
+    // 상단 크롬(제목/패딩) 높이 계산
+    const title = pad.querySelector('.panel-title');
+    const titleH = title ? Math.ceil(title.getBoundingClientRect().height) : 0;
+    const cs = getComputedStyle(pad);
+    const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+    const chrome = titleH + padV + 16; // 여유 16px
+
+    // 패널 최대 높이 = 50vh
+    const panelMaxH = Math.round(window.innerHeight * 0.5);
+    const availH = Math.max(180, panelMaxH - chrome);  // 너무 작지 않게 하한선
+
+    // 왼쪽 칸 예상 너비(46% - gap)로 이미지 비율을 유지하며 높이 산출
+    const padW = pad.clientWidth;
+    const gap = 16;
+    const leftW = Math.max(240, Math.floor((padW - gap) * 0.46));
+
+    // 이미지 원본 비율
+    const nW = img.naturalWidth || img.width;
+    const nH = img.naturalHeight || img.height;
+    if (!nW || !nH) {
+        // 이미지 정보가 아직 없으면 나중에 재측정
+        samplePanelHeightOverTime?.();
+        return;
+    }
+
+    // 가로 맞춤 시 필요한 높이와 50vh 가용 높이 중 더 작은 값을 사용
+    const fitWidthH = leftW * (nH / nW);
+    const targetH = Math.min(availH, Math.max(200, fitWidthH));
+
+    // 왼쪽 이미지 박스 고정 높이, 오른쪽 설명 박스도 동일 높이로 스크롤
+    leftBox.style.height = `${Math.round(targetH)}px`;
+    const right = pad.querySelector('#artRight');
+    if (right) { right.style.maxHeight = `${Math.round(targetH)}px`; }
+
+    // 패널 전체 높이 고정(크롬 + 본문)
+    applyPanelFlexHeight(chrome + targetH);
+}
+
+/* 선택 패널 */
+function renderChoicePanel(title, prompt, options) {
+    const btns = (options || []).map((opt, i) => `
+<button class="choice-btn" data-idx="${i}" style="display:inline-flex;align-items:center;justify-content:center;margin:6px;padding:10px 14px;border:1px solid #ddd;border-radius:10px;background:#fff;cursor:pointer;transition:transform .12s,box-shadow .12s;">${opt.label}</button>
+`).join('');
+    setPanelHTML(`
+<div class="panel-pad">
+    ${title ? `<div class="panel-title">${title}</div>` : ''}
+    ${prompt ? `<p class="info-body" style="margin:8px 0 12px;">${prompt}</p>` : ''}
+    <div class="choice-grid" style="display:flex;flex-wrap:wrap;">${btns}</div>
+</div>
+`);
+    infoPanel.querySelectorAll('.choice-btn').forEach(btn => {
+        btn.addEventListener('mouseenter', () => { btn.style.boxShadow = '0 4px 12px rgba(0,0,0,.12)'; btn.style.transform = 'translateY(-1px)'; });
+        btn.addEventListener('mouseleave', () => { btn.style.boxShadow = 'none'; btn.style.transform = 'none'; });
+        btn.addEventListener('click', () => {
+        const idx = Number(btn.getAttribute('data-idx'));
+        const opt = options[idx];
+        if (opt && opt.say) { injectUserCommand(opt.say); }
+        else if (opt && typeof opt.onClick === 'function') { opt.onClick(); }
+        });
+    });
+    applyPanelFlexHeight();
+}
+function renderFloorPicker(floors, promptText) {
+    const nice = (k) => (/^b(\d+)$/i.test(k) ? `지하 ${RegExp.$1}층` : /^(\d+)f$/i.test(k) ? `${RegExp.$1}층` : k);
+    const list = floors?.length ? floors : (['b1'].concat(Array.from({ length: 10 }, (_, i) => `${i + 1}f`)));
+    const options = list.map(k => ({ label: nice(k), say: `${nice(k)} 지도 보여줘` }));
+    renderChoicePanel('층 선택', promptText || '지하 1층부터 지상 10층까지 있어요. 몇 층 지도를 보여드릴까요?', options);
+}
+
+/* ======================================================
+  * WebSocket + TTS (중복 선언 없음)
+  * ====================================================== */
+let ws = null, wsRetry = 0, wsTimer = null, hbTimer = null, lastActivity = Date.now();
+const outbox = [];
+const HEARTBEAT_MS = 25000, STALL_MS = 65000, MAX_BACKOFF = 15000;
+
+window.__ttsWaitTimer = null; window.__lastTTSAt = 0;
+
+function startHeartbeat() {
+    if (hbTimer) clearInterval(hbTimer);
+    hbTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: 'ping' })); lastActivity = Date.now(); } catch { }
+        }
+        if (Date.now() - lastActivity > STALL_MS) scheduleReconnect(true);
+    }, HEARTBEAT_MS);
+}
+function scheduleReconnect(immediate = false) {
+    if (wsTimer) return;
+    const d = immediate ? 0 : Math.min(1000 * Math.pow(2, wsRetry++), MAX_BACKOFF);
+    wsTimer = setTimeout(() => { wsTimer = null; initWebSocket(); }, d);
+}
+function flushOutbox() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    while (outbox.length) {
+        const m = outbox.shift();
+        try { ws.send(JSON.stringify(m)); } catch { outbox.unshift(m); break; }
+    }
+}
+function sendJson(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify(obj)); } catch { outbox.push(obj); }
+    } else outbox.push(obj);
+}
+
+function initWebSocket() {
+    if (ws) { try { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; ws.close(1000, 'reinit'); } catch { } ws = null; }
+    try { ws = new WebSocket(WS_URL); } catch (e) { console.error("[WS] 생성 실패:", e); scheduleReconnect(); return; }
+
+    ws.onopen = () => { console.log("WebSocket 연결 성공"); wsRetry = 0; lastActivity = Date.now(); startHeartbeat(); flushOutbox(); };
+
+    ws.onmessage = (e) => {
+        lastActivity = Date.now();
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+
+        if (msg.stage === "stt" && msg.text) { displayUserMessage(msg.text); }
+
+        if (msg.stage === "llm" && msg.text) {
+        const ut = (msg.user_text || "").trim();
+        if (ut && ut !== lastShownUserText) { displayUserMessage(ut); }
+        displayBotResponse(msg.text);
+        clearTimeout(window.__ttsWaitTimer);
+        window.__ttsWaitTimer = setTimeout(() => {
+            if (!window.__lastTTSAt || Date.now() - window.__lastTTSAt > 700) {
+            playTTS(msg.text);
+            }
+        }, 800);
+        }
+
+        if (msg.stage === "tts" && msg.audio_url) {
+        clearTimeout(window.__ttsWaitTimer);
+        window.__lastTTSAt = Date.now();
+        player.src = msg.audio_url; player.playbackRate = 1.2;
+        player.play().catch(() => { });
+        }
+
+        if (msg.stage === "ui") {
+        switch (msg.type) {
+            case "choose_floor":
+            renderFloorPicker(msg.floors, msg.prompt); break;
+            case "choice":
+            renderChoicePanel(msg.title, msg.prompt, msg.options || []); break;
+            case "show_map":
+            showMap(msg.url); break;
+            case "show_artifact":
+            showArtifact(msg.title, msg.url, msg.desc); break;
+            case "show_info":
+            setPanelHTML(`<div class="panel-pad"><div class="panel-title">정보</div><div class="info-body">${msg.html || ''}</div></div>`); applyPanelFlexHeight(); break;
+            case "nav_route":
+            const steps = (msg.route?.steps || []).map(s => `<li>${s.text}</li>`).join('');
+            setPanelHTML(`<div class="panel-pad"><div class="panel-title">길 안내</div><ol class="info-list">${steps}</ol></div>`); applyPanelFlexHeight(); break;
+            case "call_staff_ack":
+            displayBotResponse(msg.ok ? '직원을 호출했어요. 잠시만 기다려 주세요.' : '호출에 실패했어요. 다시 시도해 주세요.'); break;
+            case "set_lang":
+            document.documentElement.lang = msg.lang || 'ko'; break;
+        }
+        }
+    };
+
+    ws.onclose = () => { startHeartbeat(); scheduleReconnect(); };
+    ws.onerror = () => { try { ws.close(); } catch { } };
+}
+window.addEventListener('online', () => scheduleReconnect(true));
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (!ws || ws.readyState !== WebSocket.OPEN)) scheduleReconnect(true);
+});
+
+async function playTTS(text) {
+    try {
+        const res = await fetch(`${BASE}/request-response`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, speed: 1.0 })
+        });
+        const { audio_url } = await res.json();
+        if (audio_url) { player.src = audio_url; player.playbackRate = 1.2; player.play().catch(() => { }); }
+    } catch (e) { console.error("TTS 재생 오류:", e); }
+}
+player.onended = () => { if (body.classList.contains('chat-open')) recordAndSend(); };
+
+/* ======================================================
+  * 좌측 버튼 → 가짜 유저 발화(중복 방지)
+  * ====================================================== */
+function injectUserCommand(text) {
+    if (!body.classList.contains('chat-open')) body.classList.add('chat-open');
+    lastShownUserText = (text || "").trim();
+    displayUserMessage(lastShownUserText);
+    try { teardownAudio(); } catch { }
+    sendJson({ type: 'synthetic_text', text: lastShownUserText });
+}
+btnMap?.addEventListener('click', () => injectUserCommand('지도 보여줘'));  // ← 공백 제거! btnMap?.addEventListener
+btnInfo?.addEventListener('click', () => injectUserCommand('정보 알려줘'));
+btnCall?.addEventListener('click', () => injectUserCommand('직원 호출해줘'));
+btnLang?.addEventListener('click', () => {
+    renderChoicePanel('언어 선택', '사용하실 언어를 선택해 주세요.', [
+        { label: '한국어', say: '한국어로 바꿔줘' },
+        { label: 'English', say: '영어로 바꿔줘' },
+        { label: '日本語', say: '일본어로 바꿔줘' },
+    ]);
+});
+
+/* ======================================================
+  * VAD 녹음
+  * ====================================================== */
+const VAD = { rmsStart: 0.020, rmsStop: 0.010, startHoldMs: 120, stopHoldMs: 800, maxRecordMs: 15000, debug: false };
+let mediaRecorder = null, audioStream = null, audioCtx = null, analyser = null, srcNode = null, rafId = 0;
+let isRecording = false, recordStartTs = 0, lastTick = 0, voiceMs = 0, silenceMs = 0;
+const vadBuf = new Float32Array(2048);
+
+async function recordAndSend() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+        stopWakeWord();
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        srcNode = audioCtx.createMediaStreamSource(audioStream);
+        analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.2;
+        srcNode.connect(analyser);
+        resetVAD(); tick(); console.log("VAD 대기 시작(말하면 자동 녹음).");
+    } catch (err) {
+        console.error("녹음 시작 실패:", err);
+        alert("마이크 권한을 허용해야 합니다. (HTTPS 또는 localhost 필요)");
+    }
+}
+function resetVAD() { isRecording = false; voiceMs = 0; silenceMs = 0; lastTick = 0; }
+function tick(ts = 0) {
+    if (!analyser) return;
+    if (lastTick === 0) lastTick = ts;
+    const dt = ts - lastTick; lastTick = ts;
+
+    analyser.getFloatTimeDomainData(vadBuf);
+    let sum = 0; for (let i = 0; i < vadBuf.length; i++) { const v = vadBuf[i]; sum += v * v; }
+    const rms = Math.sqrt(sum / vadBuf.length);
+
+    if (!isRecording) {
+        if (rms >= VAD.rmsStart) { voiceMs += dt; if (voiceMs >= VAD.startHoldMs) startRecording(); }
+        else voiceMs = 0;
+    } else {
+        if (rms < VAD.rmsStop) silenceMs += dt; else silenceMs = 0;
+        const elapsed = performance.now() - recordStartTs;
+        if (silenceMs >= VAD.stopHoldMs || elapsed >= VAD.maxRecordMs) { stopRecording(); return; }
+    }
+    rafId = requestAnimationFrame(tick);
+}
+function chooseMime() {
+    const c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg'];
+    for (const m of c) if (MediaRecorder.isTypeSupported?.(m)) return m;
+    return '';
+}
+function startRecording() {
+    if (!audioStream) return;
+    const mimeType = chooseMime();
+    mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : {});
+    const chunks = [];
+    mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.onstop = async (e) => {
+        cancelAnimationFrame(rafId); rafId = 0; teardownNodes();
+        const rec = e?.target || mediaRecorder || null;
+        const blobType = mimeType || (rec && rec.mimeType) || 'audio/webm';
+        const blob = new Blob(chunks, { type: blobType });
+        if (!blob || blob.size === 0) {
+        console.log("무음 0바이트. 재대기.");
+        setTimeout(() => { if (body.classList.contains('chat-open')) recordAndSend(); }, 300);
+        teardownStream(); return;
+        }
+        try {
+        const fd = new FormData();
+        fd.append("file", blob, "speech.webm");
+        const up = await fetch(`${BASE}/upload-audio/`, { method: "POST", body: fd });
+        if (!up.ok) { console.error("업로드 실패:", up.status); return; }
+        const { file_id } = await up.json();
+        sendJson({ file_id });
+        } catch (err) { console.error("업로드 오류:", err); }
+        finally { teardownStream(); }
+    };
+    mediaRecorder.start(); isRecording = true; recordStartTs = performance.now(); voiceMs = 0;
+    console.log("녹음 시작 (VAD).");
+}
+function stopRecording() { if (mediaRecorder && mediaRecorder.state === "recording") { mediaRecorder.stop(); console.log("녹음 종료 (VAD)."); } }
+function teardownAudio() { try { stopRecording(); } catch { } cancelAnimationFrame(rafId); rafId = 0; teardownNodes(); teardownStream(); }
+function teardownNodes() { try { srcNode && srcNode.disconnect(); } catch { } try { analyser && analyser.disconnect(); } catch { } srcNode = null; analyser = null; if (audioCtx) { audioCtx.close().catch(() => { }); audioCtx = null; } }
+function teardownStream() { if (audioStream) { try { audioStream.getTracks().forEach(t => t.stop()); } catch { } audioStream = null; } mediaRecorder = null; isRecording = false; if (!body.classList.contains('chat-open')) startWakeWord(); }
+
+/* ======================================================
+  * 얼굴 버튼(채팅 열고 닫기)
+  * ====================================================== */
+faceBtn.addEventListener('click', () => {
+    const isOpen = body.classList.contains('chat-open');
+    body.classList.toggle('chat-open');
+    if (!isOpen) {
+        stopWakeWord();
+        messages.innerHTML = ''; clearPanel();
+        displayBotResponse('무엇을 도와드릴까요?');
+        playTTS('무엇을 도와드릴까요?');
+    } else {
+        teardownAudio(); startWakeWord(); clearPanel();
+    }
+});
+
+/* =========================
+  * 웨이크워드 "에스뽀"
+  * ========================= */
+let wakeRec = null;
+let wakeActive = false;
+let wakePrimed = false;
+let wakeRestartTimer = null;
+let wakeBackoff = 300; // ms, 최대 2000ms
+
+function supportsWake() {
+    return ('webkitSpeechRecognition' in window) || ('SpeechRecognition' in window);
+}
+function norm(s) { return String(s || '').replace(/\s+/g, '').replace(/[!?,.]/g, '').toLowerCase(); }
+
+const WAKE_CANDS = [
+    '에스뽀', '에스 뽀', '에스뽀야', '에스포', '에스 보', '에스보', '스뽀', '애스뽀',
+    'sp o', 'spo', 'espo', 's-po', 'S4', 's4'
+].map(norm);
+
+function isWakePhrase(t) {
+    const n = norm(t);
+    if (WAKE_CANDS.some(c => n.includes(c))) return true;
+    if (n.includes('에스') && (n.includes('뽀') || n.includes('보') || n.includes('포'))) return true;
+    return false;
+}
+
+function restartWake(reason = 'restart') {
+    if (!wakeActive) return;
+    clearTimeout(wakeRestartTimer);
+    wakeRestartTimer = setTimeout(() => {
+        try { wakeRec && wakeRec.start(); console.log('[Wake] restart:', reason); } catch { }
+    }, wakeBackoff);
+    wakeBackoff = Math.min(wakeBackoff * 2, 2000);
+}
+
+function startWakeWord() {
+    if (!supportsWake()) { console.warn('[Wake] not supported'); return; }
+    if (wakeActive) return;
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const SGL = window.SpeechGrammarList || window.webkitSpeechGrammarList;
+
+    wakeRec = new SR();
+    wakeRec.lang = 'ko-KR';
+    wakeRec.continuous = true;
+    wakeRec.interimResults = true;
+    wakeRec.maxAlternatives = 1;
+
+    // Grammar로 가중치
+    if (SGL) {
+        const list = new SGL();
+        const grammar = '#JSGF V1.0; grammar wake; public <wake> = 에스뽀 | 에스 뽀 | 에스보 | 에스보야 | 에스포 | 스뽀 ;';
+        try { list.addFromString(grammar, 1); wakeRec.grammars = list; } catch { }
+    }
+
+    // 디버그용 이벤트
+    wakeRec.onaudiostart = () => console.log('[Wake] audiostart');
+    wakeRec.onsoundstart = () => console.log('[Wake] soundstart');
+    wakeRec.onspeechstart = () => console.log('[Wake] speechstart');
+    wakeRec.onspeechend = () => console.log('[Wake] speechend');
+    wakeRec.onsoundend = () => console.log('[Wake] soundend');
+    wakeRec.onaudioend = () => console.log('[Wake] audioend');
+
+    wakeRec.onresult = (e) => {
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+        const alt = e.results[i][0];
+        const text = alt?.transcript || '';
+        const conf = (alt?.confidence ?? 0).toFixed(2);
+        console.log('[Wake] heard:', text, 'conf:', conf);
+        if (isWakePhrase(text)) {
+            wakeBackoff = 300; // 성공 시 백오프 리셋
+            stopWakeWord();
+            openChatByWake();
+            break;
+        }
+        }
+    };
+
+    wakeRec.onerror = (ev) => {
+        console.warn('[Wake] error:', ev.error);
+        if (ev.error === 'not-allowed') { wakeActive = false; return; }
+        restartWake('onerror:' + ev.error); // no-speech/audio-capture/network 등 자동 복구
+    };
+
+    wakeRec.onend = () => {
+        if (wakeActive) restartWake('onend'); // 무음 시 onend만 올 수도 있음
+    };
+
+    try {
+        wakeRec.start();
+        wakeActive = true;
+        wakeBackoff = 300;
+        console.log('[Wake] listening… Say "에스뽀"');
+    } catch (e) {
+        console.warn('[Wake] start failed:', e);
+    }
+}
+
+function stopWakeWord() {
+    wakeActive = false;
+    clearTimeout(wakeRestartTimer);
+    wakeRestartTimer = null;
+    try { wakeRec && wakeRec.stop(); } catch { }
+    wakeRec = null;
+}
+
+// 최초 1회 사용자 제스처(브라우저 정책) 후 웨이크 시작
+function primeWakeOnce() {
+    if (wakePrimed) return;
+    wakePrimed = true;
+    startWakeWord();
+}
+window.addEventListener('pointerdown', primeWakeOnce, { once: true });
+window.addEventListener('keydown', primeWakeOnce, { once: true });
+
+// 웨이크로 채팅 열기
+function openChatByWake() {
+    if (!document.body.classList.contains('chat-open')) {
+        document.body.classList.add('chat-open');
+        try { messages.innerHTML = ''; } catch { }
+        displayBotResponse('네, 부르셨어요? 무엇을 도와드릴까요?');
+        playTTS('네, 부르셨어요? 무엇을 도와드릴까요?'); // onended → recordAndSend()
+    }
+}
+
+/* ======================================================
+ * 시작
+ * ====================================================== */
+initWebSocket();
+startWakeWord();
+  
